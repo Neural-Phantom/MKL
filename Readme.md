@@ -1,5 +1,5 @@
 # ☠️ PROJECT: MODERN KILL LAB (MKL)
-### Automated Cyber Range Deployment System // v2.1.0
+### Automated Cyber Range Deployment System // v2.2.0
 
 ![Build Status](https://img.shields.io/badge/Build-PASSING-brightgreen?style=for-the-badge&logo=github)
 ![Platform](https://img.shields.io/badge/Platform-CROSS--PLATFORM-blueviolet?style=for-the-badge&logo=linux)
@@ -26,9 +26,9 @@
 
 ## MISSION BRIEFING
 
-**Modern Kill Lab (MKL)** is a weaponized "Infrastructure-as-Code" deployment tool. It abandons legacy lab setups in favor of Hybrid Identity, AI-driven vulnerabilities, and Kubernetes attack vectors.
+**Modern Kill Lab (MKL)** is a weaponized "Infrastructure-as-Code" deployment tool. It abandons legacy lab setups in favor of Hybrid Identity, AI-driven vulnerabilities, EDR evasion techniques, and Kubernetes attack vectors.
 
-This script orchestrates a hostile environment designed to test your skills against current TTPs (Tactics, Techniques, and Procedures), moving beyond simple exploits into complex identity and logic flaws.
+This script orchestrates a hostile environment designed to test your skills against current TTPs (Tactics, Techniques, and Procedures), moving beyond simple exploits into complex identity attacks, in-memory execution, and defense evasion.
 
 ---
 
@@ -41,7 +41,7 @@ This script orchestrates a hostile environment designed to test your skills agai
 | **OS** | Windows Server 2022 (Evaluation) |
 | **Role** | Domain Controller (LAB.local) |
 
-**Vulnerability Matrix:**
+**Core Vulnerability Matrix:**
 
 | Severity | Vulnerability |
 |----------|---------------|
@@ -49,7 +49,24 @@ This script orchestrates a hostile environment designed to test your skills agai
 | `HIGH` | **Legacy HR Portal:** Custom PHP app with blind & error-based SQL Injection. |
 | `HIGH` | **Hybrid Identity Bait:** Decoy "Azure AD Connect" config with reversible credentials. |
 | `HIGH` | **AS-REP Roasting:** `svc_backup` configured with "Do not require Kerberos preauthentication". |
-| `MEDIUM` | **Kerberoasting:** `svc_sql` has a Service Principal Name (SPN) associated. |
+| `HIGH` | **Kerberoasting:** `svc_sql` has a Service Principal Name (SPN) registered. |
+
+**Advanced Offensive Labs (`C:\Tools\`):**
+
+| Lab | Path | Purpose |
+|-----|------|---------|
+| **AMSI Bypass** | `C:\Tools\AMSILab` | Weak ACLs on AMSI providers, vulnerable loader scripts |
+| **VEH Bypass** | `C:\Tools\VEHLab` | FakeEDR.exe using Vectored Exception Handlers |
+| **Reflective Injection** | `C:\Tools\ReflectiveLab` | Vulnerable .NET Assembly.Load application |
+| **Process Hollowing** | `C:\Tools\HollowingLab` | Target process list and technique documentation |
+| **Credential Dumping** | `C:\Tools\CredLab` | SAM/SYSTEM/SECURITY hive backups, Credential Manager entries |
+| **LOLBins** | `C:\Tools\LOLBinLab` | MSBuild payload, WMIC/Certutil exercises |
+| **Vulnerable Drivers** | `C:\Tools\DriverLab` | BYOVD documentation (RTCore64, DBUtil) |
+| **Persistence** | `C:\Tools\PersistenceLab` | Hidden scheduled task ("WindowsDefenderUpdate") |
+
+**Logging & Telemetry (For Bypass Practice):**
+- PowerShell ScriptBlock Logging: **ENABLED**
+- Command Line Auditing: **ENABLED**
 
 ---
 
@@ -60,14 +77,29 @@ This script orchestrates a hostile environment designed to test your skills agai
 | **OS** | Debian 12 (Bookworm) |
 | **Role** | AppSec & Container Host |
 
-**Vulnerability Matrix:**
+**Core Vulnerability Matrix:**
 
 | Severity | Vulnerability |
 |----------|---------------|
 | `CRITICAL` | **Insecure AI Agent:** Internal LLM tool vulnerable to Prompt Injection & RCE. |
-| `HIGH` | **Unsecured Kubernetes:** K3s cluster with default configs. |
+| `HIGH` | **Unsecured Kubernetes:** K3s cluster with overly permissive ServiceAccount. |
 | `HIGH` | **vAPI & crAPI:** Broken Object Level Auth (BOLA) and Mass Assignment labs. |
 | `MEDIUM` | **Juice Shop:** The gold standard for OWASP Top 10 training. |
+
+**Container & Cloud Labs:**
+
+| Lab | Path | Purpose |
+|-----|------|---------|
+| **Container Escapes** | `/home/vagrant/container_lab` | Privileged container, Docker socket mount |
+| **Kubernetes Attacks** | `/home/vagrant/k8s_lab` | `vuln-admin-sa` with cluster-admin binding |
+| **Data Exfiltration** | `/home/vagrant/exfil_lab` | Fake API keys and AWS credentials |
+
+**Linux Privilege Escalation:**
+
+| Technique | Configuration |
+|-----------|---------------|
+| **Sudo Abuse** | `vagrant` can run `/usr/bin/vim` as root (NOPASSWD) |
+| **Capabilities** | `/usr/local/bin/python_cap` has `cap_setuid+ep` |
 
 ---
 
@@ -109,9 +141,54 @@ python3 master_build.py
 | | | Helpdesk | `LAB\helpdesk` / `Help123!` |
 | | | HR Portal | `http://10.0.0.10/hr_portal` |
 | | | AD CS | `http://10.0.0.10/certsrv` |
+| | | Cred Manager | `fileserver.lab.local` → `BackupP@ss123!` |
+| | | Cred Manager | `sqlserver.lab.local` → `SQLAdm1n!` |
 | Lab-Web01 | `10.0.0.20` | SSH | `vagrant` / `vagrant` |
 | | | AI Agent | `http://10.0.0.20:5000` |
 | | | vAPI | `http://10.0.0.20:5002` |
+| | | Juice Shop | `http://10.0.0.20:3000` |
+
+---
+
+## 🗂️ TOOL DIRECTORIES
+
+### Windows (`C:\Tools\`)
+```
+C:\Tools\
+├── AMSILab\              # AMSI bypass exercises
+│   └── vulnerable_loader.ps1
+├── VEHLab\               # VEH/EDR bypass
+│   ├── FakeEDR.cs
+│   └── FakeEDR.exe
+├── ReflectiveLab\        # Reflective injection
+│   └── VulnerableLoader.cs
+├── HollowingLab\         # Process hollowing targets
+│   └── README.txt
+├── CredLab\              # Credential extraction
+│   ├── SAM.bak
+│   ├── SYSTEM.bak
+│   └── SECURITY.bak
+├── LOLBinLab\            # Living off the land
+│   └── payload.csproj
+├── DriverLab\            # BYOVD exercises
+│   └── README.md
+└── PersistenceLab\       # Persistence mechanisms
+```
+
+### Linux (`/home/vagrant/`)
+```
+/home/vagrant/
+├── ai_agent/             # Vulnerable AI app
+│   └── app.py
+├── container_lab/        # Docker escape scenarios
+│   └── docker-compose-vuln.yml
+├── k8s_lab/              # Kubernetes attacks
+│   └── vuln-sa.yaml
+├── exfil_lab/            # Data exfiltration
+│   └── .env
+└── crapi/                # OWASP crAPI
+    └── docker-compose.yml
+```
 
 ---
 
