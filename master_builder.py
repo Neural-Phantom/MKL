@@ -11,7 +11,8 @@ import ctypes
 from pathlib import Path
 
 # --- CONFIGURATION ---
-HOME_DIR = Path.home()
+# Detect home correctly even if sudo is accidentally preserved
+HOME_DIR = Path(os.path.expanduser("~"))
 BASE_DIR = HOME_DIR / "ModernHackingLab"
 
 # 1. ISO CONFIGURATION
@@ -35,34 +36,33 @@ def print_color(text, color=Colors.ENDC):
     print(f"{color}{text}{Colors.ENDC}")
 
 # ============================================================================
-# HELPER: PRIVILEGE CHECK
+# HELPER: PRIVILEGE CHECK (FIXED FOR LINUX)
 # ============================================================================
 def check_privileges():
     """
-    Enforces Administrator (Windows) or Root (Linux/Mac) privileges.
+    Enforces Administrator on Windows.
+    Enforces STANDARD USER on Linux/Mac (VirtualBox breaks as root).
     """
+    system = platform.system()
     try:
-        is_admin = False
-        if platform.system() == "Windows":
+        if system == "Windows":
             is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+            if not is_admin:
+                print_color("\n[CRITICAL] WINDOWS REQUIRES ADMIN", Colors.FAIL)
+                print("Please right-click and 'Run as Administrator'.")
+                sys.exit(1)
         else:
-            # Check for root on *nix
-            is_admin = os.geteuid() == 0
-
-        if not is_admin:
-            print_color("\n[CRITICAL ERROR] INSUFFICIENT PRIVILEGES", Colors.FAIL)
-            print_color("========================================", Colors.FAIL)
-            if platform.system() == "Windows":
-                print("You are running as a Standard User.")
-                print("Please right-click your terminal and select 'Run as Administrator'.")
-            else:
-                print("You are running as a Standard User.")
-                print("Please run this script with sudo:")
-                print(f"    sudo python3 {os.path.basename(__file__)}")
-            print_color("========================================", Colors.FAIL)
-            sys.exit(1)
+            # Linux/Mac check
+            if os.geteuid() == 0:
+                print_color("\n[CRITICAL] DO NOT RUN AS ROOT", Colors.FAIL)
+                print("VirtualBox will crash if run with sudo.")
+                print("Please run as your standard user:")
+                print(f"    python3 {os.path.basename(__file__)}")
+                print("(The script will ask for sudo password only when installing packages)")
+                sys.exit(1)
     except Exception as e:
-        print_color(f"[WARN] Could not verify privileges: {e}", Colors.YELLOW)
+        # Fallback if checks fail
+        pass
 
 # ============================================================================
 # HELPER: SYSTEM RESOURCES
@@ -133,11 +133,12 @@ class DependencyManager:
         cmd = []
         if mgr == "winget": cmd = ["winget", "install", "-e", "--id", pkg]
         elif mgr == "brew": cmd = ["brew", "install", "--cask", pkg] if "virtualbox" in pkg else ["brew", "install", pkg]
-        elif mgr == "pacman": cmd = ["pacman", "-S", "--noconfirm", pkg] # sudo not needed if running as root
-        elif mgr == "apt": cmd = ["apt-get", "install", "-y", pkg]
-        elif mgr == "dnf": cmd = ["dnf", "install", "-y", pkg]
+        elif mgr == "pacman": cmd = ["sudo", "pacman", "-S", "--noconfirm", pkg]
+        elif mgr == "apt": cmd = ["sudo", "apt-get", "install", "-y", pkg]
+        elif mgr == "dnf": cmd = ["sudo", "dnf", "install", "-y", pkg]
 
         try:
+            # Interactive sudo prompt if needed
             subprocess.run(cmd, check=True)
             print_color(f"    [SUCCESS] {pkg} installed.", Colors.GREEN)
             return True
@@ -167,15 +168,24 @@ class DependencyManager:
 # UTILITIES
 # ============================================================================
 def nuke_vm(vm_name):
+    """
+    Cleans up VMs.
+    On Linux/Mac, it aggressively finds the 'Default Machine Folder' 
+    to delete zombie directories causing VBOX_E_FILE_ERROR.
+    """
     vbox_cmd = "VBoxManage"
     if platform.system() == "Windows" and not shutil.which("VBoxManage"):
         vbox_cmd = r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
     
+    # 1. Soft Delete (Unregister)
     subprocess.run([vbox_cmd, "controlvm", vm_name, "poweroff"], stderr=subprocess.DEVNULL)
     time.sleep(1)
     subprocess.run([vbox_cmd, "unregistervm", vm_name, "--delete"], stderr=subprocess.DEVNULL)
     
+    # 2. Hard Delete (Directory) - Platform Specific Logic
     vbox_vm_path = None
+    
+    # Try to ask VBox where it stores VMs
     try:
         result = subprocess.run([vbox_cmd, "list", "systemproperties"], capture_output=True, text=True)
         for line in result.stdout.splitlines():
@@ -185,8 +195,9 @@ def nuke_vm(vm_name):
                 break
     except: pass
 
+    # Fallbacks
     if not vbox_vm_path:
-        vbox_vm_path = Path.home() / "VirtualBox VMs" / vm_name
+        vbox_vm_path = HOME_DIR / "VirtualBox VMs" / vm_name
 
     if vbox_vm_path and vbox_vm_path.exists():
         print_color(f"    [CLEAN] Removing zombie VM dir: {vbox_vm_path}", Colors.FAIL)
@@ -195,6 +206,7 @@ def nuke_vm(vm_name):
         except Exception as e:
             print_color(f"    [WARN] Failed to delete {vbox_vm_path}: {e}", Colors.YELLOW)
 
+    # 3. Output Directory Cleanup
     output_dir = BASE_DIR / f"output-{vm_name.lower().replace('lab-', '')}"
     if output_dir.exists():
         shutil.rmtree(output_dir, ignore_errors=True)
@@ -678,7 +690,7 @@ def main():
     check_privileges()
     
     print_color("==================================================================", Colors.CYAN)
-    print_color("        MODERN KILL LAB - MASTER BUILDER (v7.0 Admin Enforced)    ", Colors.CYAN)
+    print_color("        MODERN KILL LAB - MASTER BUILDER (v7.1 Permissions Fix)   ", Colors.CYAN)
     print_color("==================================================================", Colors.CYAN)
     
     dm = DependencyManager()
