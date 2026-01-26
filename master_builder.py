@@ -286,7 +286,7 @@ build {{
   }}
   provisioner "windows-restart" {{ restart_timeout = "15m" }}
   
-  # 2. SOFTWARE INSTALLATION (Hardened Retry)
+  # 2. SOFTWARE INSTALLATION (Hardened)
   provisioner "powershell" {{ 
     inline = [
       "choco install git -y --no-progress",
@@ -322,7 +322,6 @@ build {{
       "Import-Module ActiveDirectory",
       "try {{ Install-AdcsCertificationAuthority -CAType EnterpriseRootCa -CryptoProviderName 'RSA#Microsoft Software Key Storage Provider' -KeyLength 2048 -HashAlgorithmName SHA256 -CACommonName 'lab-DC01-CA' -Force }} catch {{ Write-Host 'CA Exists' }}",
       "try {{ Install-AdcsWebEnrollment -Force }} catch {{ Write-Host 'Web Enrollment Exists' }}",
-      # IIS stays on Port 80 for AD CS
       "Get-WebBinding -Port 80 -Name 'Default Web Site' -Protocol http" 
     ]
   }}
@@ -342,7 +341,9 @@ build {{
       "New-ADUser -Name svc_sql -SamAccountName svc_sql -AccountPassword (ConvertTo-SecureString 'Password123!' -AsPlainText -Force) -Enabled `$true -PasswordNeverExpires `$true",
       "New-ADUser -Name svc_backup -SamAccountName svc_backup -AccountPassword (ConvertTo-SecureString 'Backup2024!' -AsPlainText -Force) -Enabled `$true -PasswordNeverExpires `$true",
       "New-ADUser -Name helpdesk -SamAccountName helpdesk -AccountPassword (ConvertTo-SecureString 'Help123!' -AsPlainText -Force) -Enabled `$true -PasswordNeverExpires `$true",
+      # VULN: AS-REP Roasting (Fixed Syntax)
       "Set-ADUser -Identity svc_backup -DoesNotRequirePreAuth `$true",
+      # VULN: Kerberoasting
       "Set-ADUser -Identity svc_sql -ServicePrincipalNames @{{Add='MSSQLSvc/dc01.lab.local:1433'}}",
       
       # C. SQL DB Setup
@@ -350,13 +351,14 @@ build {{
       "Invoke-Sqlcmd -Query \\"USE HR_DB; CREATE TABLE Employees (ID INT, Name VARCHAR(100), Salary INT, SSN VARCHAR(20)); INSERT INTO Employees VALUES (1, 'Alice Manager', 90000, '000-00-1234'), (2, 'Bob User', 50000, '000-00-5678');\\" -ServerInstance 'localhost\\SQLEXPRESS'",
       "Invoke-Sqlcmd -Query \\"CREATE LOGIN [LAB\\\\svc_sql] FROM WINDOWS; USE HR_DB; CREATE USER [LAB\\\\svc_sql] FOR LOGIN [LAB\\\\svc_sql]; ALTER ROLE [db_owner] ADD MEMBER [LAB\\\\svc_sql];\\" -ServerInstance 'localhost\\SQLEXPRESS'",
       
-      # D. DEPLOY LEGACY HR PORTAL (PHP+ODBC)
-      # Hardened: Using ODBC to avoid php_sqlsrv.dll missing driver issues
+      # D. DEPLOY LEGACY HR PORTAL (Hardened: PHP+ODBC)
       "New-Item -Path 'C:\\xampp\\htdocs\\hr_portal' -ItemType Directory -Force",
+      # Enable ODBC Extension in PHP.ini
       "(Get-Content 'C:\\xampp\\php\\php.ini') -replace ';extension=odbc', 'extension=odbc' | Set-Content 'C:\\xampp\\php\\php.ini'",
       "$php_code = @(",
       "  '<?php',",
       "  '$serverName = \"localhost\\SQLEXPRESS\";',",
+      "  '// Hardened: Using ODBC to avoid driver hell',",
       "  '$conn = odbc_connect(\"Driver={{SQL Server}};Server=$serverName;Database=HR_DB\", \"LAB\\\\svc_sql\", \"Password123!\");',",
       "  '$id = $_GET[\"id\"];',",
       "  'if (!$conn) {{ die(\"Connection failed: \" . odbc_errormsg()); }}',",
@@ -389,12 +391,20 @@ build {{
     ]
   }}
 
-  # 6. ADVANCED OFFENSIVE LABS
+  # 6. ADVANCED OFFENSIVE & VISIBILITY LABS
   provisioner "powershell" {{
     inline = [
       "Write-Host '>>> DEPLOYING ADVANCED OFFENSIVE SCENARIOS...'",
       "`$csc = 'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe'",
       
+      # 0. SYSMON INSTALLATION
+      "Write-Host '>>> INSTALLING SYSMON...'",
+      "mkdir C:\\Tools\\Sysmon -Force",
+      "Invoke-WebRequest -Uri 'https://download.sysinternals.com/files/Sysmon.zip' -OutFile 'C:\\Tools\\Sysmon\\Sysmon.zip'",
+      "Expand-Archive 'C:\\Tools\\Sysmon\\Sysmon.zip' -DestinationPath 'C:\\Tools\\Sysmon' -Force",
+      "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml' -OutFile 'C:\\Tools\\Sysmon\\config.xml'",
+      "& 'C:\\Tools\\Sysmon\\Sysmon64.exe' -accepteula -i 'C:\\Tools\\Sysmon\\config.xml'",
+
       # 1. AMSI BYPASS LAB
       "New-Item -Path 'C:\\Tools\\AMSILab' -ItemType Directory -Force",
       "$amsi_vuln = @'",
@@ -565,21 +575,30 @@ source "virtualbox-iso" "web01" {{
 build {{
   sources = ["source.virtualbox-iso.web01"]
   
-  # 1. INSTALL BASE, DOCKER, K3S
+  # 1. INSTALL BASE, DOCKER, K3S, AUDITD
   provisioner "shell" {{
     inline = [
       "sudo apt-get update",
-      "sudo apt-get install -y curl gnupg net-tools python3-flask python3-pip gcc make libcap2-bin vim",
+      "sudo apt-get install -y curl gnupg net-tools python3-flask python3-pip gcc make libcap2-bin vim auditd audispd-plugins samba",
       # Docker Install
       "curl -fsSL https://get.docker.com -o get-docker.sh",
       "sudo sh get-docker.sh",
       "sudo usermod -aG docker vagrant",
       "sudo systemctl enable docker; sudo systemctl start docker",
-      # K3s Install (Kubernetes) - Disabled Traefik
+      # K3s Install
       "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='--disable=traefik' sh -",
       "mkdir -p /home/vagrant/.kube",
       "sudo cp /etc/rancher/k3s/k3s.yaml /home/vagrant/.kube/config",
-      "sudo chown vagrant:vagrant /home/vagrant/.kube/config"
+      "sudo chown vagrant:vagrant /home/vagrant/.kube/config",
+      # Auditd Config
+      "sudo auditctl -w /etc/passwd -p wa -k identity",
+      "sudo auditctl -w /bin/bash -p x -k exec",
+      # Samba Config
+      "echo '[share]' | sudo tee -a /etc/samba/smb.conf",
+      "echo 'path = /home/vagrant/share' | sudo tee -a /etc/samba/smb.conf",
+      "echo 'read only = no' | sudo tee -a /etc/samba/smb.conf",
+      "mkdir -p /home/vagrant/share && chmod 777 /home/vagrant/share",
+      "sudo systemctl restart smbd"
     ]
   }}
 
@@ -604,11 +623,11 @@ build {{
       "sudo docker run -d --restart unless-stopped -p 5002:80 roottusk/vapi",
       "mkdir -p ~/crapi",
       "cd ~/crapi",
-      # Pinned URL to avoid upstream breakage
+      # Hardened: Pinned URL
       "curl -o docker-compose.yml https://raw.githubusercontent.com/OWASP/crAPI/v1.0.0/deploy/docker/docker-compose.yml",
       "sudo docker compose pull",
       "sudo docker compose -f docker-compose.yml up -d || echo 'Docker Compose Failed'",
-      # Dynamic Interface config
+      # Hardened: Dynamic Interface
       "IFACE=$(ip -o link show | awk -F': ' '{{print $2}}' | grep -v lo | head -1)",
       "echo \"auto $IFACE\" | sudo tee -a /etc/network/interfaces",
       "echo \"iface $IFACE inet static\" | sudo tee -a /etc/network/interfaces",
@@ -621,6 +640,7 @@ build {{
     inline = [
       "echo '>>> DEPLOYING ADVANCED LINUX SCENARIOS...'",
       "mkdir -p /home/vagrant/container_lab",
+      # Hardened: Correct printf heredoc
       "printf \"version: '3'\\nservices:\\n  vuln_privileged:\\n    image: ubuntu:latest\\n    privileged: true\\n    command: sleep infinity\\n  vuln_hostsock:\\n    image: ubuntu:latest\\n    volumes:\\n      - /var/run/docker.sock:/var/run/docker.sock\\n    command: sleep infinity\\n\" > /home/vagrant/container_lab/docker-compose-vuln.yml",
       "cd /home/vagrant/container_lab && sudo docker compose -f docker-compose-vuln.yml up -d || exit 1",
       
@@ -632,7 +652,7 @@ build {{
       "printf \"apiVersion: v1\\nkind: ServiceAccount\\nmetadata:\\n  name: vuln-admin-sa\\n  namespace: default\\n---\\napiVersion: rbac.authorization.k8s.io/v1\\nkind: ClusterRoleBinding\\nmetadata:\\n  name: vuln-admin-binding\\nroleRef:\\n  apiGroup: rbac.authorization.k8s.io\\n  kind: ClusterRole\\n  name: cluster-admin\\nsubjects:\\n- kind: ServiceAccount\\n  name: vuln-admin-sa\\n  namespace: default\\n\" > /home/vagrant/k8s_lab/vuln-sa.yaml",
       "sudo kubectl apply -f /home/vagrant/k8s_lab/vuln-sa.yaml",
       
-      # Linux PrivEsc (Sudo & SUID)
+      # Linux PrivEsc
       "echo 'vagrant ALL=(ALL) NOPASSWD: /usr/bin/vim' | sudo tee -a /etc/sudoers.d/vuln_sudo",
       "sudo cp /usr/bin/python3 /usr/local/bin/python_cap",
       "sudo setcap cap_setuid+ep /usr/local/bin/python_cap",
