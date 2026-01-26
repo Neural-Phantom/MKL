@@ -14,7 +14,6 @@ HOME_DIR = Path.home()
 BASE_DIR = HOME_DIR / "ModernHackingLab"
 
 # 1. ISO CONFIGURATION
-# We explicitly define the target filenames so Packer always finds them.
 WS2022_TARGET_NAME = "ws2022.iso"
 WS2022_URL = "https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso"
 
@@ -25,8 +24,9 @@ class Colors:
     HEADER = '\033[95m'
     CYAN = '\033[96m'
     GREEN = '\033[92m'
-    WARNING = '\033[93m'
+    YELLOW = '\033[93m'
     FAIL = '\033[91m'
+    GRAY = '\033[90m'
     ENDC = '\033[0m'
     BOLD = '\033[1m'
 
@@ -89,7 +89,7 @@ class DependencyManager:
 
     def check_packer(self):
         if shutil.which("packer"): return True
-        print_color("\n[!] Packer is MISSING.", Colors.WARNING)
+        print_color("\n[!] Packer is MISSING.", Colors.YELLOW)
         if self.pkg_manager and input(f"    Install Packer? (y/n): ").lower() == 'y':
             return self._run_install({"winget": "HashiCorp.Packer", "brew": "packer", "pacman": "packer", "apt": "packer", "dnf": "packer"})
         return False
@@ -101,7 +101,7 @@ class DependencyManager:
                 return str(default_path) if default_path.exists() else "VBoxManage"
         elif shutil.which("VBoxManage"): return "VBoxManage"
 
-        print_color("\n[!] VirtualBox is MISSING.", Colors.WARNING)
+        print_color("\n[!] VirtualBox is MISSING.", Colors.YELLOW)
         if self.pkg_manager and input(f"    Install VirtualBox? (y/n): ").lower() == 'y':
             if self._run_install({"winget": "Oracle.VirtualBox", "brew": "virtualbox", "pacman": "virtualbox virtualbox-host-modules-arch", "apt": "virtualbox", "dnf": "VirtualBox"}):
                 return r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe" if self.os_type == "Windows" else "VBoxManage"
@@ -122,10 +122,6 @@ def nuke_vm(vm_name, vbox_cmd):
     if vm_folder.exists(): shutil.rmtree(vm_folder, ignore_errors=True)
 
 def download_file(url, dest_path):
-    """
-    Downloads a file and forces the destination filename.
-    Includes progress bar and error handling.
-    """
     print_color(f"    [DOWNLOADING] Target: {dest_path.name}...", Colors.CYAN)
     print(f"      Source: {url}")
     try:
@@ -133,16 +129,12 @@ def download_file(url, dest_path):
             readsofar = blocknum * blocksize
             if totalsize > 0:
                 percent = readsofar * 1e2 / totalsize
-                s = "\r%5.1f%% %*d / %d" % (
-                    percent, len(str(totalsize)), readsofar, totalsize)
+                s = "\r%5.1f%% %*d / %d" % (percent, len(str(totalsize)), readsofar, totalsize)
                 sys.stderr.write(s)
-                if readsofar >= totalsize: # near the end
-                    sys.stderr.write("\n")
+                if readsofar >= totalsize: sys.stderr.write("\n")
         
-        # This line ensures the file is saved exactly as 'dest_path'
         urllib.request.urlretrieve(url, dest_path, reporthook)
         
-        # Verify file isn't empty (basic check)
         if dest_path.stat().st_size < 1000:
             print_color("    [ERROR] File too small. Download likely failed.", Colors.FAIL)
             dest_path.unlink()
@@ -152,11 +144,11 @@ def download_file(url, dest_path):
         return True
     except Exception as e:
         print_color(f"\n    [ERROR] Download Failed! {e}", Colors.FAIL)
-        if dest_path.exists(): dest_path.unlink() # Clean up partial file
+        if dest_path.exists(): dest_path.unlink()
         return False
 
 def generate_files():
-    print_color("\n>>> GENERATING CONFIGURATION FILES...", Colors.WARNING)
+    print_color("\n>>> GENERATING CONFIGURATION FILES...", Colors.YELLOW)
 
     # 3A. PRESEED.CFG
     preseed_content = """d-i debian-installer/locale string en_US
@@ -253,7 +245,6 @@ d-i finish-install/reboot_in_progress note
     with open(BASE_DIR / "answer_files" / "Autounattend.xml", "w") as f: f.write(xml_dc)
 
     # 3D. DC01.PKR.HCL
-    # NOTE: We use as_uri() to make the path valid for Packer on both Windows and Linux
     iso_path_win = (BASE_DIR / WS2022_TARGET_NAME).as_uri()
     
     hcl_dc = f"""
@@ -328,23 +319,28 @@ build {{
     ]
   }}
   
-  # 5. VULNERABLE CONFIGURATION
+  # 5. VULNERABLE CONFIGURATION & USER CREATION
   provisioner "powershell" {{
     inline = [
-      "Write-Host '>>> CONFIGURING VULNERABLE SERVICES...'",
+      "Write-Host '>>> CONFIGURING USERS & SERVICES...'",
       # A. SQL Server Network Config
       "`$sqlPath = 'HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\*\\MSSQLServer\\SuperSocketNetLib\\Tcp\\IPAll'",
       "`$tcpKey = Get-Item `$sqlPath | Select-Object -First 1",
       "New-ItemProperty -Path `$tcpKey.PSPath -Name 'TcpPort' -Value '1433' -PropertyType String -Force",
       "Stop-Service 'MSSQL`$SQLEXPRESS' -Force; Start-Service 'MSSQL`$SQLEXPRESS'",
       
-      # B. Create Users & DB
+      # B. Create Users (Matching Deployment Summary)
       "New-ADUser -Name svc_sql -SamAccountName svc_sql -AccountPassword (ConvertTo-SecureString 'Password123!' -AsPlainText -Force) -Enabled `$true -PasswordNeverExpires `$true",
+      "New-ADUser -Name svc_backup -SamAccountName svc_backup -AccountPassword (ConvertTo-SecureString 'Backup2024!' -AsPlainText -Force) -Enabled `$true -PasswordNeverExpires `$true",
+      "New-ADUser -Name helpdesk -SamAccountName helpdesk -AccountPassword (ConvertTo-SecureString 'Help123!' -AsPlainText -Force) -Enabled `$true -PasswordNeverExpires `$true",
+      "Set-ADAccountControl -Identity svc_backup -DoesNotRequirePreAuth `$true",
+      
+      # C. SQL DB Setup
       "Invoke-Sqlcmd -Query \\"CREATE DATABASE HR_DB;\\" -ServerInstance 'localhost\\SQLEXPRESS'",
       "Invoke-Sqlcmd -Query \\"USE HR_DB; CREATE TABLE Employees (ID INT, Name VARCHAR(100), Salary INT, SSN VARCHAR(20)); INSERT INTO Employees VALUES (1, 'Alice Manager', 90000, '000-00-1234'), (2, 'Bob User', 50000, '000-00-5678');\\" -ServerInstance 'localhost\\SQLEXPRESS'",
       "Invoke-Sqlcmd -Query \\"CREATE LOGIN [LAB\\\\svc_sql] FROM WINDOWS; USE HR_DB; CREATE USER [LAB\\\\svc_sql] FOR LOGIN [LAB\\\\svc_sql]; ALTER ROLE [db_owner] ADD MEMBER [LAB\\\\svc_sql];\\" -ServerInstance 'localhost\\SQLEXPRESS'",
       
-      # C. DEPLOY LEGACY HR PORTAL (SQLi Vulnerability)
+      # D. DEPLOY LEGACY HR PORTAL
       "New-Item -Path 'C:\\xampp\\htdocs\\hr_portal' -ItemType Directory -Force",
       "$php_code = @(",
       "  '<?php',",
@@ -361,7 +357,7 @@ build {{
       ")",
       "Set-Content -Path 'C:\\xampp\\htdocs\\hr_portal\\index.php' -Value $php_code",
 
-      # D. FAKE CLOUD SYNC
+      # E. FAKE CLOUD SYNC
       "New-Item -Path 'C:\\Program Files\\Azure AD Sync' -ItemType Directory -Force",
       "$cloud_xml = @(",
       "  '<AzureADSyncConfig>',",
@@ -373,7 +369,7 @@ build {{
       ")",
       "Set-Content -Path 'C:\\Program Files\\Azure AD Sync\\connection.xml' -Value $cloud_xml",
       
-      # E. Firewall
+      # F. Firewall
       "New-NetFirewallRule -DisplayName 'Allow HTTP' -Direction Inbound -LocalPort 80 -Protocol TCP -Action Allow",
       "New-NetFirewallRule -DisplayName 'Allow MSSQL' -Direction Inbound -LocalPort 1433 -Protocol TCP -Action Allow"
     ]
@@ -405,7 +401,6 @@ build {{
     with open(BASE_DIR / "dc01.pkr.hcl", "w") as f: f.write(hcl_dc)
 
     # 3E. WEB01.PKR.HCL
-    # NOTE: We use as_uri() here as well
     iso_path_deb = (BASE_DIR / DEBIAN_TARGET_NAME).as_uri()
     
     hcl_web = f"""
@@ -518,7 +513,7 @@ EOF",
 # ============================================================================
 def main():
     print_color("==================================================================", Colors.CYAN)
-    print_color("        MODERNIZED KILL LAB - MASTER BUILDER (Auto-Install)       ", Colors.CYAN)
+    print_color("        MODERN KILL LAB - MASTER BUILDER (Auto-Install)           ", Colors.CYAN)
     print_color("==================================================================", Colors.CYAN)
     
     # 1. DEPENDENCY CHECK
@@ -547,9 +542,8 @@ def main():
     # Windows Server 2022
     ws2022_path = BASE_DIR / WS2022_TARGET_NAME
     if not ws2022_path.exists():
-        print_color(f"\n[-] '{WS2022_TARGET_NAME}' is missing.", Colors.WARNING)
+        print_color(f"\n[-] '{WS2022_TARGET_NAME}' is missing.", Colors.YELLOW)
         if input("    [?] Download Windows Server 2022 Evaluation now? (y/n): ").lower() == 'y':
-            # This calls the download function which forces the filename
             success = download_file(WS2022_URL, ws2022_path)
             if not success:
                 print_color("\n[MANUAL ACTION REQUIRED]", Colors.FAIL)
@@ -578,7 +572,7 @@ def main():
     build_dc = True
     result = subprocess.run([vbox_cmd, "list", "vms"], capture_output=True, text=True)
     if "Lab-DC01" in result.stdout:
-        print_color("    [!] Found existing Domain Controller: Lab-DC01", Colors.WARNING)
+        print_color("    [!] Found existing Domain Controller: Lab-DC01", Colors.YELLOW)
         resp = input("    [?] Keep existing DC? (y/n) [Default: y]: ").lower()
         if resp != 'n':
             print_color("    [KEEP] Preserving Lab-DC01.", Colors.GREEN)
@@ -593,7 +587,7 @@ def main():
     generate_files()
 
     # 4. BUILD EXECUTION
-    print_color("\n>>> STARTING PACKER BUILDS...", Colors.WARNING)
+    print_color("\n>>> STARTING PACKER BUILDS...", Colors.YELLOW)
     subprocess.run(["packer", "init", "."], shell=(dm.os_type=="Windows"))
 
     if build_dc:
@@ -612,7 +606,7 @@ def main():
         sys.exit(1)
 
     # 5. NETWORK CONFIGURATION
-    print_color("\n>>> CONFIGURING NETWORK...", Colors.WARNING)
+    print_color("\n>>> CONFIGURING NETWORK...", Colors.YELLOW)
     vm_list = subprocess.run([vbox_cmd, "list", "vms"], capture_output=True, text=True).stdout
     
     if "Lab-DC01" in vm_list:
@@ -623,25 +617,24 @@ def main():
         subprocess.run([vbox_cmd, "modifyvm", "Lab-Web01", "--nic1", "intnet", "--intnet1", "psycholab"], stderr=subprocess.DEVNULL)
         print_color("    [OK] Lab-Web01 Network Configured", Colors.GREEN)
 
-    # 6. SUMMARY
+    # 6. DEPLOYMENT SUMMARY
     print_color("\n==================================================================", Colors.CYAN)
-    print_color("                  MODERN LAB ACCESS CREDENTIALS                   ", Colors.CYAN)
+    print_color("                  LAB ACCESS CREDENTIALS                          ", Colors.CYAN)
     print_color("==================================================================", Colors.CYAN)
-    print("SYSTEM       IP              APP/SERVICE              CREDENTIALS")
-    print("-----------  --------------  -----------------------  ------------------")
-    print("Lab-DC01     10.0.0.10       Domain Controller        LAB\\vagrant : Vagrant!123")
-    print("                             Legacy HR (SQLi)         http://10.0.0.10/hr_portal")
-    print("                             AD CS Web Enroll         http://10.0.0.10/certsrv")
-    print("                             Fake Cloud Config        C:\\Program Files\\Azure AD Sync")
+    print_color("SYSTEM       IP ADDRESS      USERNAME           PASSWORD", Colors.YELLOW)
+    print_color("-----------  --------------  -----------------  ------------------", Colors.YELLOW)
+    print("Lab-DC01     10.0.0.10 (*)   LAB\\vagrant        Vagrant!123")
+    print("                             LAB\\Administrator  Vagrant!123")
+    print("                             LAB\\svc_sql        Password123!")
+    print("                             LAB\\svc_backup     Backup2024!")
+    print("                             LAB\\helpdesk       Help123!")
     print("")
-    print("Lab-Web01    10.0.0.20       SSH / System             vagrant : vagrant")
-    print("                             Insecure AI Agent        http://10.0.0.20:5000/ask")
-    print("                             vAPI (Vulnerable API)    http://10.0.0.20:5002")
-    print("                             Juice Shop               http://10.0.0.20:3000")
-    print("                             K3s (Kubernetes)         kubectl get nodes")
+    print("Lab-Web01    10.0.0.20       vagrant            vagrant")
+    print("                             root               (sudo su)")
     print_color("==================================================================", Colors.CYAN)
-    print("(*) Note: Reboot VMs once to ensure Static IPs apply.")
-    print_color("                   DEPLOYMENT COMPLETE!                           ", Colors.GREEN)
+    print_color("(*) Note: Windows IP is set automatically on next boot.", Colors.GRAY)
+    print_color("==================================================================", Colors.GREEN)
+    print_color("                   DEPLOYMENT COMPLETE! If you get stuck check the lab guide!                           ", Colors.GREEN)
     print_color("==================================================================", Colors.GREEN)
 
 if __name__ == "__main__":
