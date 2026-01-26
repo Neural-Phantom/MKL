@@ -6,7 +6,6 @@ import time
 import shutil
 import platform
 import urllib.request
-import urllib.error
 from pathlib import Path
 
 # --- CONFIGURATION ---
@@ -287,12 +286,20 @@ build {{
   }}
   provisioner "windows-restart" {{ restart_timeout = "15m" }}
   
-  # 2. SOFTWARE INSTALLATION
+  # 2. SOFTWARE INSTALLATION (Hardened Retry)
   provisioner "powershell" {{ 
     inline = [
-      "choco install git xampp -y --no-progress",
-      "Write-Host '>>> INSTALLING SQL SERVER (Verbose)...'",
-      "choco install sql-server-express -y --verbose --debug --execution-timeout=3600"
+      "choco install git -y --no-progress",
+      "Write-Host '>>> INSTALLING SQL SERVER (Verbose/Retry)...'",
+      "$max=3; $i=0; while($i -lt $max){{ try {{ choco install sql-server-express -y --execution-timeout=3600; break }} catch {{ $i++; Start-Sleep 10 }} }}",
+      "if (-not (Get-Service 'MSSQL`$SQLEXPRESS' -ErrorAction SilentlyContinue)) {{ Write-Error 'SQL Server install failed'; exit 1 }}",
+      # XAMPP Install & Service Config
+      "choco install xampp -y --no-progress",
+      "C:\\xampp\\apache\\bin\\httpd.exe -k install",
+      # Move XAMPP to 8080 to avoid IIS conflict
+      "(Get-Content 'C:\\xampp\\apache\\conf\\httpd.conf') -replace 'Listen 80', 'Listen 8080' | Set-Content 'C:\\xampp\\apache\\conf\\httpd.conf'",
+      "(Get-Content 'C:\\xampp\\apache\\conf\\httpd.conf') -replace 'ServerName localhost:80', 'ServerName localhost:8080' | Set-Content 'C:\\xampp\\apache\\conf\\httpd.conf'",
+      "Start-Service 'Apache2.4'"
     ] 
   }}
   provisioner "windows-restart" {{ restart_timeout = "15m" }}
@@ -315,44 +322,49 @@ build {{
       "Import-Module ActiveDirectory",
       "try {{ Install-AdcsCertificationAuthority -CAType EnterpriseRootCa -CryptoProviderName 'RSA#Microsoft Software Key Storage Provider' -KeyLength 2048 -HashAlgorithmName SHA256 -CACommonName 'lab-DC01-CA' -Force }} catch {{ Write-Host 'CA Exists' }}",
       "try {{ Install-AdcsWebEnrollment -Force }} catch {{ Write-Host 'Web Enrollment Exists' }}",
-      "Get-WebBinding -Port 80 -Name 'Default Web Site' -Protocol http | Remove-WebBinding"
+      # IIS stays on Port 80 for AD CS
+      "Get-WebBinding -Port 80 -Name 'Default Web Site' -Protocol http" 
     ]
   }}
   
-  # 5. VULNERABLE CONFIGURATION & USER CREATION
+  # 5. CORE VULNERABLE CONFIGURATION
   provisioner "powershell" {{
     inline = [
       "Write-Host '>>> CONFIGURING USERS & SERVICES...'",
-      # A. SQL Server Network Config
+      # A. SQL Server Config
+      "Install-Module -Name SqlServer -Force -AllowClobber",
       "`$sqlPath = 'HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\*\\MSSQLServer\\SuperSocketNetLib\\Tcp\\IPAll'",
       "`$tcpKey = Get-Item `$sqlPath | Select-Object -First 1",
       "New-ItemProperty -Path `$tcpKey.PSPath -Name 'TcpPort' -Value '1433' -PropertyType String -Force",
       "Stop-Service 'MSSQL`$SQLEXPRESS' -Force; Start-Service 'MSSQL`$SQLEXPRESS'",
       
-      # B. Create Users (Matching Deployment Summary)
+      # B. Create Users
       "New-ADUser -Name svc_sql -SamAccountName svc_sql -AccountPassword (ConvertTo-SecureString 'Password123!' -AsPlainText -Force) -Enabled `$true -PasswordNeverExpires `$true",
       "New-ADUser -Name svc_backup -SamAccountName svc_backup -AccountPassword (ConvertTo-SecureString 'Backup2024!' -AsPlainText -Force) -Enabled `$true -PasswordNeverExpires `$true",
       "New-ADUser -Name helpdesk -SamAccountName helpdesk -AccountPassword (ConvertTo-SecureString 'Help123!' -AsPlainText -Force) -Enabled `$true -PasswordNeverExpires `$true",
-      "Set-ADAccountControl -Identity svc_backup -DoesNotRequirePreAuth `$true",
+      "Set-ADUser -Identity svc_backup -DoesNotRequirePreAuth `$true",
+      "Set-ADUser -Identity svc_sql -ServicePrincipalNames @{{Add='MSSQLSvc/dc01.lab.local:1433'}}",
       
       # C. SQL DB Setup
       "Invoke-Sqlcmd -Query \\"CREATE DATABASE HR_DB;\\" -ServerInstance 'localhost\\SQLEXPRESS'",
       "Invoke-Sqlcmd -Query \\"USE HR_DB; CREATE TABLE Employees (ID INT, Name VARCHAR(100), Salary INT, SSN VARCHAR(20)); INSERT INTO Employees VALUES (1, 'Alice Manager', 90000, '000-00-1234'), (2, 'Bob User', 50000, '000-00-5678');\\" -ServerInstance 'localhost\\SQLEXPRESS'",
       "Invoke-Sqlcmd -Query \\"CREATE LOGIN [LAB\\\\svc_sql] FROM WINDOWS; USE HR_DB; CREATE USER [LAB\\\\svc_sql] FOR LOGIN [LAB\\\\svc_sql]; ALTER ROLE [db_owner] ADD MEMBER [LAB\\\\svc_sql];\\" -ServerInstance 'localhost\\SQLEXPRESS'",
       
-      # D. DEPLOY LEGACY HR PORTAL
+      # D. DEPLOY LEGACY HR PORTAL (PHP+ODBC)
+      # Hardened: Using ODBC to avoid php_sqlsrv.dll missing driver issues
       "New-Item -Path 'C:\\xampp\\htdocs\\hr_portal' -ItemType Directory -Force",
+      "(Get-Content 'C:\\xampp\\php\\php.ini') -replace ';extension=odbc', 'extension=odbc' | Set-Content 'C:\\xampp\\php\\php.ini'",
       "$php_code = @(",
       "  '<?php',",
       "  '$serverName = \"localhost\\SQLEXPRESS\";',",
-      "  '$connectionInfo = array(\"Database\"=>\"HR_DB\", \"UID\"=>\"LAB\\\\svc_sql\", \"PWD\"=>\"Password123!\");',",
-      "  '$conn = sqlsrv_connect($serverName, $connectionInfo);',",
+      "  '$conn = odbc_connect(\"Driver={{SQL Server}};Server=$serverName;Database=HR_DB\", \"LAB\\\\svc_sql\", \"Password123!\");',",
       "  '$id = $_GET[\"id\"];',",
-      "  '// VULNERABILITY: No sanitation on $id allows SQL Injection',",
+      "  'if (!$conn) {{ die(\"Connection failed: \" . odbc_errormsg()); }}',",
+      "  '// VULNERABILITY: SQL Injection',",
       "  '$sql = \"SELECT Name, Salary FROM Employees WHERE ID = \" . $id;',",
-      "  '$stmt = sqlsrv_query($conn, $sql);',",
-      "  'if($stmt === false) { die(print_r(sqlsrv_errors(), true)); }',",
-      "  'while($row = sqlsrv_fetch_array($stmt, SQLSRV_FETCH_ASSOC)) { echo \"Name: \".$row[\"Name\"].\"<br>\"; }',",
+      "  '$result = odbc_exec($conn, $sql);',",
+      "  'if(!$result) {{ die(\"Query failed\"); }}',",
+      "  'while($row = odbc_fetch_array($result)) {{ echo \"Name: \".$row[\"Name\"].\"<br>\"; }}',",
       "  '?>'",
       ")",
       "Set-Content -Path 'C:\\xampp\\htdocs\\hr_portal\\index.php' -Value $php_code",
@@ -369,16 +381,134 @@ build {{
       ")",
       "Set-Content -Path 'C:\\Program Files\\Azure AD Sync\\connection.xml' -Value $cloud_xml",
       
-      # F. Firewall
+      # F. Firewall Rules
       "New-NetFirewallRule -DisplayName 'Allow HTTP' -Direction Inbound -LocalPort 80 -Protocol TCP -Action Allow",
-      "New-NetFirewallRule -DisplayName 'Allow MSSQL' -Direction Inbound -LocalPort 1433 -Protocol TCP -Action Allow"
+      "New-NetFirewallRule -DisplayName 'Allow HTTP 8080' -Direction Inbound -LocalPort 8080 -Protocol TCP -Action Allow",
+      "New-NetFirewallRule -DisplayName 'Allow MSSQL' -Direction Inbound -LocalPort 1433 -Protocol TCP -Action Allow",
+      "New-NetFirewallRule -DisplayName 'Allow RDP' -Direction Inbound -LocalPort 3389 -Protocol TCP -Action Allow"
+    ]
+  }}
+
+  # 6. ADVANCED OFFENSIVE LABS
+  provisioner "powershell" {{
+    inline = [
+      "Write-Host '>>> DEPLOYING ADVANCED OFFENSIVE SCENARIOS...'",
+      "`$csc = 'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe'",
+      
+      # 1. AMSI BYPASS LAB
+      "New-Item -Path 'C:\\Tools\\AMSILab' -ItemType Directory -Force",
+      "$amsi_vuln = @'",
+      "Add-Type -TypeDefinition @\"",
+      "using System;",
+      "using System.Runtime.InteropServices;",
+      "public class AMSITest {{",
+      "    [DllImport(\"amsi.dll\")]",
+      "    public static extern int AmsiInitialize(string appName, out IntPtr amsiContext);",
+      "}}",
+      "\"@",
+      "# Lab: Patch amsi.dll in memory",
+      "'@",
+      "Set-Content -Path 'C:\\Tools\\AMSILab\\vulnerable_loader.ps1' -Value $amsi_vuln",
+      "$acl = Get-Acl 'HKLM:\\SOFTWARE\\Microsoft\\AMSI\\Providers'",
+      "$rule = New-Object System.Security.AccessControl.RegistryAccessRule('BUILTIN\\Users','FullControl','Allow')",
+      "$acl.SetAccessRule($rule)",
+      "Set-Acl 'HKLM:\\SOFTWARE\\Microsoft\\AMSI\\Providers' $acl",
+      
+      # 2. VEH BYPASS LAB
+      "New-Item -Path 'C:\\Tools\\VEHLab' -ItemType Directory -Force",
+      "$veh_monitor = @'",
+      "using System;",
+      "using System.Runtime.InteropServices;",
+      "class FakeEDR {{",
+      "    [DllImport(\"kernel32.dll\")]",
+      "    static extern IntPtr AddVectoredExceptionHandler(uint first, IntPtr handler);",
+      "    static void Main() {{",
+      "        Console.WriteLine(\"[FakeEDR] Monitoring with VEH...\");",
+      "        while(true) {{ System.Threading.Thread.Sleep(1000); }}",
+      "    }}",
+      "}}",
+      "'@",
+      "Set-Content -Path 'C:\\Tools\\VEHLab\\FakeEDR.cs' -Value $veh_monitor",
+      "Invoke-Expression \"& $csc /out:C:\\Tools\\VEHLab\\FakeEDR.exe C:\\Tools\\VEHLab\\FakeEDR.cs\"",
+      "if (-not (Test-Path 'C:\\Tools\\VEHLab\\FakeEDR.exe')) {{ Write-Warning 'FakeEDR.exe compilation failed' }}",
+      
+      # 3. REFLECTIVE INJECTION
+      "New-Item -Path 'C:\\Tools\\ReflectiveLab' -ItemType Directory -Force",
+      "icacls 'C:\\Tools\\ReflectiveLab' /grant 'BUILTIN\\Users:(OI)(CI)F'",
+      "$reflect_app = @'",
+      "using System;",
+      "using System.Reflection;",
+      "using System.IO;",
+      "class VulnerableLoader {{",
+      "    static void Main(string[] args) {{",
+      "        if (args.Length > 0) {{",
+      "            byte[] assemblyBytes = File.ReadAllBytes(args[0]);",
+      "            Assembly asm = Assembly.Load(assemblyBytes);",
+      "            asm.EntryPoint.Invoke(null, null);",
+      "        }}",
+      "    }}",
+      "}}",
+      "'@",
+      "Set-Content -Path 'C:\\Tools\\ReflectiveLab\\VulnerableLoader.cs' -Value $reflect_app",
+      
+      # 4. PROCESS HOLLOWING
+      "New-Item -Path 'C:\\Tools\\HollowingLab' -ItemType Directory -Force",
+      "$hollow_targets = @'",
+      "TARGETS:",
+      "EASY: notepad.exe",
+      "MEDIUM: svchost.exe",
+      "HARD: werfault.exe",
+      "'@",
+      "Set-Content -Path 'C:\\Tools\\HollowingLab\\README.txt' -Value $hollow_targets",
+      
+      # 5. CREDENTIAL DUMPING (Hardened: Create Dir First)
+      "cmdkey /add:fileserver.lab.local /user:LAB\\backup_admin /pass:BackupP@ss123!",
+      "cmdkey /add:sqlserver.lab.local /user:sa /pass:SQLAdm1n!",
+      "New-Item -Path 'C:\\Users\\vagrant\\Documents\\Passwords' -ItemType Directory -Force",
+      "New-Item -Path 'C:\\Tools\\CredLab' -ItemType Directory -Force",
+      "reg save HKLM\\SAM C:\\Tools\\CredLab\\SAM.bak",
+      "reg save HKLM\\SYSTEM C:\\Tools\\CredLab\\SYSTEM.bak",
+      "reg save HKLM\\SECURITY C:\\Tools\\CredLab\\SECURITY.bak",
+      "icacls 'C:\\Tools\\CredLab' /grant 'BUILTIN\\Users:(OI)(CI)R'",
+      
+      # 6. LOLBINS
+      "New-Item -Path 'C:\\Tools\\LOLBinLab' -ItemType Directory -Force",
+      "$msbuild_proj = @'",
+      "<Project ToolsVersion=\"4.0\" xmlns=\"http://schemas.microsoft.com/developer/msbuild/2003\">",
+      "  <Target Name=\"LOLBin\"> <ClassExample /> </Target>",
+      "  <UsingTask TaskName=\"ClassExample\" TaskFactory=\"CodeTaskFactory\" AssemblyFile=\"C:\\Windows\\Microsoft.Net\\Framework\\v4.0.30319\\Microsoft.Build.Tasks.v4.0.dll\">",
+      "    <Task> <Code Type=\"Class\" Language=\"cs\"> <![CDATA[",
+      "      using System; using Microsoft.Build.Utilities;",
+      "      public class ClassExample : Task {{ public override bool Execute() {{ Console.WriteLine(\"PWNED\"); return true; }} }}",
+      "    ]]> </Code> </Task>",
+      "  </UsingTask>",
+      "</Project>",
+      "'@",
+      "Set-Content -Path 'C:\\Tools\\LOLBinLab\\payload.csproj' -Value $msbuild_proj",
+      
+      # 7. DRIVER LAB
+      "New-Item -Path 'C:\\Tools\\DriverLab' -ItemType Directory -Force",
+      "Set-Content -Path 'C:\\Tools\\DriverLab\\README.md' -Value 'Download RTCore64.sys and DBUtil_2_3.sys here for testing.'",
+      
+      # 8. ETW/LOGGING
+      "New-Item -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging' -Force",
+      "Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging' -Name 'EnableScriptBlockLogging' -Value 1",
+      
+      # 9. PERSISTENCE (Hardened: Unregister First)
+      "New-Item -Path 'C:\\Tools\\PersistenceLab' -ItemType Directory -Force",
+      "Unregister-ScheduledTask -TaskName 'WindowsDefenderUpdate' -Confirm:$false -ErrorAction SilentlyContinue",
+      "$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-WindowStyle Hidden -Command \"echo persistence > C:\\Windows\\Temp\\persist.txt\"'",
+      "$trigger = New-ScheduledTaskTrigger -AtLogOn",
+      "$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest",
+      "Register-ScheduledTask -TaskName 'WindowsDefenderUpdate' -Action $action -Trigger $trigger -Principal $principal"
     ]
   }}
   
-  # 6. IP STAGING
+  # 7. IP STAGING
   provisioner "powershell" {{
     inline = [
       "Write-Host '>>> STAGING STATIC IP CONFIG...'",
+      "Unregister-ScheduledTask -TaskName 'SetStaticIP' -Confirm:$false -ErrorAction SilentlyContinue",
       "`$lines = @(",
       "  '$ip = ''10.0.0.10''',",
       "  '$prefix = 24',",
@@ -435,11 +565,11 @@ source "virtualbox-iso" "web01" {{
 build {{
   sources = ["source.virtualbox-iso.web01"]
   
-  # 1. INSTALL DOCKER, PYTHON, K3S
+  # 1. INSTALL BASE, DOCKER, K3S
   provisioner "shell" {{
     inline = [
       "sudo apt-get update",
-      "sudo apt-get install -y curl gnupg net-tools python3-flask python3-pip",
+      "sudo apt-get install -y curl gnupg net-tools python3-flask python3-pip gcc make libcap2-bin vim",
       # Docker Install
       "curl -fsSL https://get.docker.com -o get-docker.sh",
       "sudo sh get-docker.sh",
@@ -458,30 +588,8 @@ build {{
     inline = [
       "echo '>>> DEPLOYING INSECURE AI AGENT...'",
       "mkdir -p /home/vagrant/ai_agent",
-      "cat <<EOF > /home/vagrant/ai_agent/app.py",
-from flask import Flask, request
-import subprocess
-
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return '<h3>NeuroCorp Internal AI Tool</h3><p>Use /ask?query=... to use the system agent.</p>'
-
-@app.route('/ask')
-def ask():
-    query = request.args.get('query', '')
-    if not query: return 'No query provided'
-    try:
-        output = subprocess.check_output(query, shell=True, stderr=subprocess.STDOUT)
-        return f'<pre>{{output.decode()}}</pre>'
-    except Exception as e:
-        return f'Error: {{str(e)}}'
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
-EOF",
-      "echo '[Unit]\\nDescription=Insecure AI Agent\\nAfter=network.target\\n[Service]\\nUser=root\\nWorkingDirectory=/home/vagrant/ai_agent\\nExecStart=/usr/bin/python3 app.py\\nRestart=always\\n[Install]\\nWantedBy=multi-user.target' | sudo tee /etc/systemd/system/ai_agent.service",
+      "printf 'from flask import Flask, request\\nimport subprocess\\napp = Flask(__name__)\\n@app.route(\"/\")\\ndef home():\\n    return \"Insecure AI Agent\"\\n@app.route(\"/ask\")\\ndef ask():\\n    query = request.args.get(\"query\", \"\")\\n    try:\\n        output = subprocess.check_output(query, shell=True, stderr=subprocess.STDOUT)\\n        return f\"<pre>{{output.decode()}}</pre>\"\\n    except Exception as e:\\n        return f\"Error: {{str(e)}}\"\\nif __name__ == \"__main__\":\\n    app.run(host=\"0.0.0.0\", port=5000)\\n' > /home/vagrant/ai_agent/app.py",
+      "printf '[Unit]\\nDescription=Insecure AI Agent\\nAfter=network.target\\n[Service]\\nUser=root\\nWorkingDirectory=/home/vagrant/ai_agent\\nExecStart=/usr/bin/python3 app.py\\nRestart=always\\n[Install]\\nWantedBy=multi-user.target\\n' | sudo tee /etc/systemd/system/ai_agent.service",
       "sudo systemctl daemon-reload",
       "sudo systemctl enable ai_agent",
       "sudo systemctl start ai_agent"
@@ -496,12 +604,43 @@ EOF",
       "sudo docker run -d --restart unless-stopped -p 5002:80 roottusk/vapi",
       "mkdir -p ~/crapi",
       "cd ~/crapi",
-      "curl -o docker-compose.yml https://raw.githubusercontent.com/OWASP/crAPI/main/deploy/docker/docker-compose.yml",
+      # Pinned URL to avoid upstream breakage
+      "curl -o docker-compose.yml https://raw.githubusercontent.com/OWASP/crAPI/v1.0.0/deploy/docker/docker-compose.yml",
       "sudo docker compose pull",
-      "sudo docker compose -f docker-compose.yml --compatibility up -d",
-      "echo 'auto enp0s3' | sudo tee -a /etc/network/interfaces",
-      "echo 'iface enp0s3 inet static' | sudo tee -a /etc/network/interfaces",
+      "sudo docker compose -f docker-compose.yml up -d || echo 'Docker Compose Failed'",
+      # Dynamic Interface config
+      "IFACE=$(ip -o link show | awk -F': ' '{{print $2}}' | grep -v lo | head -1)",
+      "echo \"auto $IFACE\" | sudo tee -a /etc/network/interfaces",
+      "echo \"iface $IFACE inet static\" | sudo tee -a /etc/network/interfaces",
       "echo '  address 10.0.0.20/24' | sudo tee -a /etc/network/interfaces"
+    ]
+  }}
+
+  # 4. ADVANCED CONTAINER & LINUX LABS
+  provisioner "shell" {{
+    inline = [
+      "echo '>>> DEPLOYING ADVANCED LINUX SCENARIOS...'",
+      "mkdir -p /home/vagrant/container_lab",
+      "printf \"version: '3'\\nservices:\\n  vuln_privileged:\\n    image: ubuntu:latest\\n    privileged: true\\n    command: sleep infinity\\n  vuln_hostsock:\\n    image: ubuntu:latest\\n    volumes:\\n      - /var/run/docker.sock:/var/run/docker.sock\\n    command: sleep infinity\\n\" > /home/vagrant/container_lab/docker-compose-vuln.yml",
+      "cd /home/vagrant/container_lab && sudo docker compose -f docker-compose-vuln.yml up -d || exit 1",
+      
+      # Kubernetes Vulnerabilities (Hardened Wait Loop)
+      "echo 'Waiting for K3s to be ready...'",
+      "until sudo kubectl get nodes 2>/dev/null | grep -q ' Ready'; do sleep 5; done",
+      "echo 'K3s is Ready.'",
+      "mkdir -p /home/vagrant/k8s_lab",
+      "printf \"apiVersion: v1\\nkind: ServiceAccount\\nmetadata:\\n  name: vuln-admin-sa\\n  namespace: default\\n---\\napiVersion: rbac.authorization.k8s.io/v1\\nkind: ClusterRoleBinding\\nmetadata:\\n  name: vuln-admin-binding\\nroleRef:\\n  apiGroup: rbac.authorization.k8s.io\\n  kind: ClusterRole\\n  name: cluster-admin\\nsubjects:\\n- kind: ServiceAccount\\n  name: vuln-admin-sa\\n  namespace: default\\n\" > /home/vagrant/k8s_lab/vuln-sa.yaml",
+      "sudo kubectl apply -f /home/vagrant/k8s_lab/vuln-sa.yaml",
+      
+      # Linux PrivEsc (Sudo & SUID)
+      "echo 'vagrant ALL=(ALL) NOPASSWD: /usr/bin/vim' | sudo tee -a /etc/sudoers.d/vuln_sudo",
+      "sudo cp /usr/bin/python3 /usr/local/bin/python_cap",
+      "sudo setcap cap_setuid+ep /usr/local/bin/python_cap",
+      
+      # Exfil Lab
+      "mkdir -p /home/vagrant/exfil_lab",
+      "echo 'API_KEY=sk_live_1234567890abcdef' > /home/vagrant/exfil_lab/.env",
+      "echo 'AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE' >> /home/vagrant/exfil_lab/.env"
     ]
   }}
 }}
@@ -539,7 +678,6 @@ def main():
     os.chdir(BASE_DIR)
 
     # 2. ISO CHECKS & DOWNLOADS
-    # Windows Server 2022
     ws2022_path = BASE_DIR / WS2022_TARGET_NAME
     if not ws2022_path.exists():
         print_color(f"\n[-] '{WS2022_TARGET_NAME}' is missing.", Colors.YELLOW)
@@ -561,7 +699,6 @@ def main():
     else:
         print_color(f"    [CHECK] {WS2022_TARGET_NAME} found.", Colors.GREEN)
 
-    # Debian
     debian_path = BASE_DIR / DEBIAN_TARGET_NAME
     if not debian_path.exists():
         download_file(DEBIAN_URL, debian_path)
@@ -591,7 +728,7 @@ def main():
     subprocess.run(["packer", "init", "."], shell=(dm.os_type=="Windows"))
 
     if build_dc:
-        print_color("\n    [BUILD] DC01 (Windows + AD CS + Hybrid Identity)...", Colors.CYAN)
+        print_color("\n    [BUILD] DC01 (Windows + AD CS + Hybrid + High Gear)...", Colors.CYAN)
         ret = subprocess.call(["packer", "build", "-force", "dc01.pkr.hcl"], shell=(dm.os_type=="Windows"))
         if ret != 0:
             print_color("DC01 Build FAILED.", Colors.FAIL)
@@ -599,7 +736,7 @@ def main():
     else:
         print_color("\n    [SKIP] DC01 Build Skipped.", Colors.GREEN)
 
-    print_color("\n    [BUILD] Web01 (Debian + K3s + vAPI + AI)...", Colors.CYAN)
+    print_color("\n    [BUILD] Web01 (Debian + K3s + vAPI + AI + Containers)...", Colors.CYAN)
     ret = subprocess.call(["packer", "build", "-force", "web01.pkr.hcl"], shell=(dm.os_type=="Windows"))
     if ret != 0:
         print_color("Web01 Build FAILED.", Colors.FAIL)
@@ -628,6 +765,8 @@ def main():
     print("                             LAB\\svc_sql        Password123!")
     print("                             LAB\\svc_backup     Backup2024!")
     print("                             LAB\\helpdesk       Help123!")
+    print("                             AD CS Web          http://10.0.0.10/certsrv")
+    print("                             Legacy HR Portal   http://10.0.0.10:8080/hr_portal")
     print("")
     print("Lab-Web01    10.0.0.20       vagrant            vagrant")
     print("                             root               (sudo su)")
