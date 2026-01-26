@@ -303,7 +303,7 @@ sudo tail -f /var/log/audit/audit.log
 C:\Tools\
 ├── Sysmon\
 │   ├── Sysmon64.exe
-│   └── config.xml                  # SwiftOnSecurity config
+│   └── config.xml                  
 ├── AMSILab\
 │   └── vulnerable_loader.ps1       # AMSI test harness
 ├── VEHLab\
@@ -342,18 +342,6 @@ C:\Tools\
     └── config                      # K3s kubeconfig
 ```
 
----
-
-## 📚 REFERENCES
-
-| Resource | URL |
-|----------|-----|
-| MITRE ATT&CK | https://attack.mitre.org/ |
-| LOLBAS Project | https://lolbas-project.github.io/ |
-| GTFOBins | https://gtfobins.github.io/ |
-| Sigma Rules | https://github.com/SigmaHQ/sigma |
-| Atomic Red Team | https://github.com/redcanaryco/atomic-red-team |
-| Sysmon Config | https://github.com/SwiftOnSecurity/sysmon-config |
 
 ---
 
