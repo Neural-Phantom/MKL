@@ -1,15 +1,25 @@
 # ☠️ PROJECT: MODERN KILL LAB (MKL)
-### Automated Cyber Range Deployment System // v2.0.0
+### Automated Cyber Range Deployment System // v2.1.0
 
 ![Build Status](https://img.shields.io/badge/Build-PASSING-brightgreen?style=for-the-badge&logo=github)
 ![Platform](https://img.shields.io/badge/Platform-CROSS--PLATFORM-blueviolet?style=for-the-badge&logo=linux)
 ![Security Level](https://img.shields.io/badge/Security-OFFENSIVE-red?style=for-the-badge&logo=kali-linux)
 ![Author](https://img.shields.io/badge/Operator-NEURAL_PHANTOM-orange?style=for-the-badge)
 
-```text
- █▀▄▀█ █▀▀█ █▀▀▄ █▀▀ █▀▀█ █▀▀▄    █ █ █ █ █    █      █▀▀█ █▀▀▄ 
- █ ▀ █ █  █ █  █ █▀▀ █▄▄█ █▄▄▀    █▄▀▄█ █ █    █      █▄▄█ █▀▀▄ 
- ▀   ▀ ▀▀▀▀ ▀▀▀  ▀▀▀ ▀  ▀ ▀  ▀    ▀   ▀ ▀ ▀▄▄  █▄▄▄   ▀  ▀ ▀▀▀  
+```
+███╗   ███╗ ██████╗ ██████╗ ███████╗██████╗ ███╗   ██╗
+████╗ ████║██╔═══██╗██╔══██╗██╔════╝██╔══██╗████╗  ██║
+██╔████╔██║██║   ██║██║  ██║█████╗  ██████╔╝██╔██╗ ██║
+██║╚██╔╝██║██║   ██║██║  ██║██╔══╝  ██╔══██╗██║╚██╗██║
+██║ ╚═╝ ██║╚██████╔╝██████╔╝███████╗██║  ██║██║ ╚████║
+╚═╝     ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝
+                                                       
+██╗  ██╗██╗██╗     ██╗         ██╗      █████╗ ██████╗ 
+██║ ██╔╝██║██║     ██║         ██║     ██╔══██╗██╔══██╗
+█████╔╝ ██║██║     ██║         ██║     ███████║██████╔╝
+██╔═██╗ ██║██║     ██║         ██║     ██╔══██║██╔══██╗
+██║  ██╗██║███████╗███████╗    ███████╗██║  ██║██████╔╝
+╚═╝  ╚═╝╚═╝╚══════╝╚══════╝    ╚══════╝╚═╝  ╚═╝╚═════╝ 
 ```
 
 ---
@@ -18,7 +28,7 @@
 
 **Modern Kill Lab (MKL)** is a weaponized "Infrastructure-as-Code" deployment tool. It abandons legacy lab setups in favor of Hybrid Identity, AI-driven vulnerabilities, and Kubernetes attack vectors.
 
-This script does not just "install VMs." It orchestrates a hostile environment designed to test your skills against current TTPs (Tactics, Techniques, and Procedures).
+This script orchestrates a hostile environment designed to test your skills against current TTPs (Tactics, Techniques, and Procedures), moving beyond simple exploits into complex identity and logic flaws.
 
 ---
 
@@ -35,10 +45,11 @@ This script does not just "install VMs." It orchestrates a hostile environment d
 
 | Severity | Vulnerability |
 |----------|---------------|
-| `CRITICAL` | **AD CS Web Enrollment:** Misconfigured Certificate Authority vulnerable to NTLM Relay (ESC8). |
+| `CRITICAL` | **AD CS Web Enrollment:** Misconfigured CA vulnerable to NTLM Relay (ESC8). |
 | `HIGH` | **Legacy HR Portal:** Custom PHP app with blind & error-based SQL Injection. |
 | `HIGH` | **Hybrid Identity Bait:** Decoy "Azure AD Connect" config with reversible credentials. |
-| `MEDIUM` | **Weak Service Accounts:** `LAB\svc_sql` running privileged services. |
+| `HIGH` | **AS-REP Roasting:** `svc_backup` configured with "Do not require Kerberos preauthentication". |
+| `MEDIUM` | **Kerberoasting:** `svc_sql` has a Service Principal Name (SPN) associated. |
 
 ---
 
@@ -94,6 +105,8 @@ python3 master_build.py
 |--------|------------|---------|-------------|
 | Lab-DC01 | `10.0.0.10` | RDP / WinRM | `LAB\vagrant` / `Vagrant!123` |
 | | | SQL DB | `LAB\svc_sql` / `Password123!` |
+| | | Backup Svc | `LAB\svc_backup` / `Backup2024!` |
+| | | Helpdesk | `LAB\helpdesk` / `Help123!` |
 | | | HR Portal | `http://10.0.0.10/hr_portal` |
 | | | AD CS | `http://10.0.0.10/certsrv` |
 | Lab-Web01 | `10.0.0.20` | SSH | `vagrant` / `vagrant` |
