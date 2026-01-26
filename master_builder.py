@@ -14,12 +14,15 @@ from pathlib import Path
 HOME_DIR = Path.home()
 BASE_DIR = HOME_DIR / "ModernHackingLab"
 
-# 1. ISO CONFIGURATION
+# 1. ISO CONFIGURATION (With Checksums)
 WS2022_TARGET_NAME = "ws2022.iso"
 WS2022_URL = "https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso"
+# Checksum is 'none' for Windows Eval as MS rotates binaries, but we suppress warning in Packer config
+WS2022_CHECKSUM = "none"
 
 DEBIAN_TARGET_NAME = "debian.iso"
 DEBIAN_URL = "https://cdimage.debian.org/cdimage/archive/12.5.0/amd64/iso-cd/debian-12.5.0-amd64-netinst.iso"
+DEBIAN_CHECKSUM = "sha256:013f5b44670d8e235318f814e86727227d82d4eb727d2bc50630ba7be04a390e"
 
 class Colors:
     HEADER = '\033[95m'
@@ -134,19 +137,35 @@ class DependencyManager:
 # UTILITIES
 # ============================================================================
 def nuke_vm(vm_name):
+    """
+    Aggressively deletes VMs to prevent 'Machine settings file already exists' errors.
+    """
     vbox = "VBoxManage"
     if platform.system() == "Windows" and not shutil.which("VBoxManage"):
         vbox = r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
     
-    result = subprocess.run([vbox, "list", "vms"], capture_output=True, text=True)
-    if vm_name in result.stdout:
-        print_color(f"    [CLEAN] Deleting {vm_name}...", Colors.FAIL)
-        subprocess.run([vbox, "controlvm", vm_name, "poweroff"], stderr=subprocess.DEVNULL)
-        time.sleep(2)
-        subprocess.run([vbox, "unregistervm", vm_name, "--delete"], stderr=subprocess.DEVNULL)
+    # 1. Try Soft Delete via VBoxManage
+    subprocess.run([vbox, "controlvm", vm_name, "poweroff"], stderr=subprocess.DEVNULL)
+    time.sleep(1)
+    subprocess.run([vbox, "unregistervm", vm_name, "--delete"], stderr=subprocess.DEVNULL)
     
-    if "DC01" in vm_name: shutil.rmtree(BASE_DIR / "output-dc01", ignore_errors=True)
-    if "Web01" in vm_name: shutil.rmtree(BASE_DIR / "output-web01", ignore_errors=True)
+    # 2. Hard Delete: Default VirtualBox Folder
+    # Linux/Mac: ~/VirtualBox VMs/Lab-DC01
+    # Windows: C:\Users\User\VirtualBox VMs\Lab-DC01
+    vbox_default_dir = Path.home() / "VirtualBox VMs" / vm_name
+    if vbox_default_dir.exists():
+        print_color(f"    [CLEAN] Removing leftover VM dir: {vbox_default_dir}", Colors.FAIL)
+        try:
+            shutil.rmtree(vbox_default_dir, ignore_errors=True)
+        except Exception as e:
+            print_color(f"    [WARN] Could not delete {vbox_default_dir}: {e}", Colors.YELLOW)
+
+    # 3. Hard Delete: Packer Output Directory
+    # Check current directory
+    local_output = BASE_DIR / f"output-{vm_name.lower().replace('lab-', '')}"
+    if local_output.exists():
+        print_color(f"    [CLEAN] Removing Packer output dir: {local_output}", Colors.FAIL)
+        shutil.rmtree(local_output, ignore_errors=True)
 
 def download_file(url, dest_path):
     print_color(f"    [DOWNLOADING] Target: {dest_path.name}...", Colors.CYAN)
@@ -213,7 +232,7 @@ d-i preseed/late_command string \\
 d-i finish-install/reboot_in_progress note
 """)
 
-    # 3B. PLUGINS (FIXED SYNTAX)
+    # 3B. PLUGINS
     with open(BASE_DIR / "plugins.pkr.hcl", "w") as f:
         f.write("""packer {
   required_plugins {
@@ -393,10 +412,8 @@ class FakeEDR {
         "New-ADUser -Name svc_backup -SamAccountName svc_backup -AccountPassword (ConvertTo-SecureString 'Backup2024!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "New-ADUser -Name helpdesk -SamAccountName helpdesk -AccountPassword (ConvertTo-SecureString 'Help123!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "Write-Host '>>> [4/10] Setting User Vulnerabilities...' -ForegroundColor Cyan",
-        
         # FIX: The following line replaces the broken "Set-ADUser -DoesNotRequirePreAuth" command
         "$u = Get-ADUser -Identity svc_backup -Properties UserAccountControl; $u.UserAccountControl = $u.UserAccountControl -bor 4194304; Set-ADUser -Instance $u",
-        
         "Set-ADUser -Identity svc_sql -ServicePrincipalNames @{Add='MSSQLSvc/dc01.lab.local:1433'}",
         "Write-Host '>>> [5/10] Creating SQL Database...' -ForegroundColor Cyan",
         "Invoke-Sqlcmd -Query \"CREATE DATABASE HR_DB;\" -ServerInstance 'localhost\\SQLEXPRESS'",
@@ -484,7 +501,7 @@ source "virtualbox-iso" "dc01" {{
   cpus                 = 2
   memory               = {ram_mb}
   disk_size            = 81920
-  iso_checksum         = "none"
+  iso_checksum         = "{WS2022_CHECKSUM}"
   headless             = false
   communicator         = "winrm"
   winrm_username       = "vagrant"
@@ -574,8 +591,8 @@ build {{
         "echo 'Waiting for K3s...'",
         "until sudo kubectl get nodes 2>/dev/null | grep -q ' Ready'; do sleep 5; done",
         "mkdir -p /home/vagrant/k8s_lab",
-        r'printf "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: vuln-admin-sa\n  namespace: default\n---\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nmetadata:\n  name: vuln-binding\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: ClusterRole\n  name: cluster-admin\nsubjects:\n- kind: ServiceAccount\n  name: vuln-admin-sa\n  namespace: default\n" > /home/vagrant/k8s_lab/vuln-sa.yaml',
-        "sudo kubectl apply -f /home/vagrant/k8s_lab/vuln-sa.yaml",
+        r'printf "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: vuln-admin-sa\n  namespace: default\n---\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nmetadata:\n  name: vuln-binding\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: ClusterRole\n  name: cluster-admin\nsubjects:\n- kind: ServiceAccount\n  name: vuln-admin-sa\n  namespace: default\n" > /home/vagrant/k8s_lab/vuln.yaml',
+        "sudo kubectl apply -f /home/vagrant/k8s_lab/vuln.yaml",
         "echo 'vagrant ALL=(ALL) NOPASSWD: /usr/bin/vim' | sudo tee -a /etc/sudoers.d/vuln_sudo",
         "sudo cp /usr/bin/python3 /usr/local/bin/python_cap",
         "sudo setcap cap_setuid+ep /usr/local/bin/python_cap",
@@ -590,7 +607,7 @@ source "virtualbox-iso" "web01" {{
   vm_name              = "Lab-Web01"
   guest_os_type        = "Debian_64"
   iso_url              = "{iso_path_deb}"
-  iso_checksum         = "none"
+  iso_checksum         = "{DEBIAN_CHECKSUM}"
   cpus                 = 2
   memory               = 4096
   disk_size            = 40000
@@ -628,9 +645,10 @@ build {{
 # ============================================================================
 def main():
     print_color("==================================================================", Colors.CYAN)
-    print_color("        MODERN KILL LAB - MASTER BUILDER (v5.3 Syntax Fix)        ", Colors.CYAN)
+    print_color("        MODERN KILL LAB - MASTER BUILDER (v5.4 Linux Fix)         ", Colors.CYAN)
     print_color("==================================================================", Colors.CYAN)
     
+    # 1. DEPENDENCY CHECK
     dm = DependencyManager()
     print(f"Platform: {dm.os_type}")
     if not dm.check_packer(): return
@@ -643,6 +661,7 @@ def main():
     (BASE_DIR / "http").mkdir(exist_ok=True)
     os.chdir(BASE_DIR)
 
+    # 2. ISO CHECKS
     ws2022_path = BASE_DIR / WS2022_TARGET_NAME
     if not ws2022_path.exists():
         print_color(f"\n[-] '{WS2022_TARGET_NAME}' is missing.", Colors.YELLOW)
@@ -655,9 +674,11 @@ def main():
         download_file(DEBIAN_URL, debian_path)
     else: print_color(f"    [CHECK] {DEBIAN_TARGET_NAME} found.", Colors.GREEN)
 
+    # 3. CLEANUP
     nuke_vm("Lab-DC01")
     nuke_vm("Lab-Web01")
     
+    # 4. BUILD
     generate_files()
     print_color("\n>>> STARTING PACKER BUILDS...", Colors.YELLOW)
     subprocess.run(["packer", "init", "."], shell=(dm.os_type=="Windows"))
