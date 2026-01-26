@@ -6,6 +6,8 @@ import time
 import shutil
 import platform
 import urllib.request
+import base64
+import ctypes
 from pathlib import Path
 
 # --- CONFIGURATION ---
@@ -30,22 +32,42 @@ class Colors:
 def print_color(text, color=Colors.ENDC):
     print(f"{color}{text}{Colors.ENDC}")
 
+# ============================================================================
+# HELPER: DYNAMIC RAM CALCULATION
+# ============================================================================
+def get_optimal_ram_mb():
+    total_ram_mb = 4096
+    try:
+        if platform.system() == "Windows":
+            kernel32 = ctypes.windll.kernel32
+            c_ulonglong = ctypes.c_ulonglong
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong), ('ullTotalPhys', c_ulonglong), ('ullAvailPhys', c_ulonglong), ('ullTotalPageFile', c_ulonglong), ('ullAvailPageFile', c_ulonglong), ('ullTotalVirtual', c_ulonglong), ('ullAvailVirtual', c_ulonglong), ('ullAvailExtendedVirtual', c_ulonglong)]
+            memoryStatus = MEMORYSTATUSEX()
+            memoryStatus.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            kernel32.GlobalMemoryStatusEx(ctypes.byref(memoryStatus))
+            total_ram_mb = int(memoryStatus.ullTotalPhys / (1024 * 1024))
+        elif platform.system() == "Linux":
+            with open('/proc/meminfo', 'r') as mem:
+                for line in mem:
+                    if "MemTotal" in line: total_ram_mb = int(line.split()[1]) // 1024; break
+        elif platform.system() == "Darwin":
+            total_ram_mb = 16384 
+    except: pass
+    target = int(total_ram_mb * 0.5)
+    return max(4096, min(8192, target))
+
+# ============================================================================
+# HELPER: CONTENT ENCODING
+# ============================================================================
+def encode_file_content(content):
+    return base64.b64encode(content.encode('utf-8')).decode('utf-8')
+
 def to_hcl(lines):
-    """
-    Sanitizes a list of strings for HCL (HashiCorp Configuration Language).
-    1. Escapes backslashes (C:\Windows -> C:\\Windows)
-    2. Escapes double quotes (" -> \")
-    3. Wraps in double quotes.
-    """
     sanitized = []
     for line in lines:
-        # Escape backslashes first
-        clean = line.replace('\\', '\\\\')
-        # Escape double quotes
-        clean = clean.replace('"', '\\"')
+        clean = line.replace('\\', '\\\\').replace('"', '\\"')
         sanitized.append(f'"{clean}"')
-    
-    # Join with comma and newline for HCL array
     return "[\n    " + ",\n    ".join(sanitized) + "\n  ]"
 
 # ============================================================================
@@ -60,7 +82,6 @@ class DependencyManager:
         if self.os_type == "Windows": return "winget"
         if self.os_type == "Darwin": return "brew"
         if self.os_type == "Linux":
-            # Simple distro check
             try:
                 with open("/etc/os-release") as f:
                     data = f.read().lower()
@@ -124,7 +145,6 @@ def nuke_vm(vm_name):
         time.sleep(2)
         subprocess.run([vbox, "unregistervm", vm_name, "--delete"], stderr=subprocess.DEVNULL)
     
-    # Cleanup output dirs
     if "DC01" in vm_name: shutil.rmtree(BASE_DIR / "output-dc01", ignore_errors=True)
     if "Web01" in vm_name: shutil.rmtree(BASE_DIR / "output-web01", ignore_errors=True)
 
@@ -149,8 +169,15 @@ def download_file(url, dest_path):
         if dest_path.exists(): dest_path.unlink()
         return False
 
+# ============================================================================
+# FILE GENERATION (VERBOSE)
+# ============================================================================
 def generate_files():
     print_color("\n>>> GENERATING CONFIGURATION FILES...", Colors.YELLOW)
+    
+    # RAM Calculation
+    ram_mb = get_optimal_ram_mb()
+    print_color(f"    [CONFIG] Optimized RAM Allocation: {ram_mb} MB", Colors.GREEN)
 
     # 3A. PRESEED.CFG
     with open(BASE_DIR / "http" / "preseed.cfg", "w") as f:
@@ -186,7 +213,7 @@ d-i preseed/late_command string \\
 d-i finish-install/reboot_in_progress note
 """)
 
-    # 3B. PLUGINS.PKR.HCL
+    # 3B. PLUGINS (FIXED SYNTAX)
     with open(BASE_DIR / "plugins.pkr.hcl", "w") as f:
         f.write("""packer {
   required_plugins {
@@ -198,7 +225,7 @@ d-i finish-install/reboot_in_progress note
 }
 """)
 
-    # 3C. AUTOUNATTEND.XML
+    # 3C. AUTOUNATTEND
     with open(BASE_DIR / "answer_files" / "Autounattend.xml", "w") as f:
         f.write("""<?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
@@ -247,127 +274,190 @@ d-i finish-install/reboot_in_progress note
 """)
 
     # =========================================================================
-    # GENERATE DC01.PKR.HCL
+    # PAYLOAD ENCODING
     # =========================================================================
-    iso_path_win = (BASE_DIR / WS2022_TARGET_NAME).as_uri()
+    php_src = """<?php
+$server = 'localhost\\SQLEXPRESS';
+$conn = odbc_connect("Driver={SQL Server};Server=$server;Database=HR_DB", 'LAB\\svc_sql', 'Password123!');
+$id = $_GET['id'];
+if (!$conn) { die('Connection failed: ' . odbc_errormsg()); }
+$sql = "SELECT Name, Salary FROM Employees WHERE ID = " . $id;
+$result = odbc_exec($conn, $sql);
+if(!$result) { die('Query failed'); }
+while($row = odbc_fetch_array($result)) { echo 'Name: '.$row['Name'].'<br>'; }
+?>"""
+    php_b64 = encode_file_content(php_src)
+
+    xml_src = """<AzureADSyncConfig><PasswordEncrypted>VABhAGwAbABoAGEAbABsAGEAMQAyADMAIQ==</PasswordEncrypted></AzureADSyncConfig>"""
+    xml_b64 = encode_file_content(xml_src)
+
+    amsi_src = """
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class AMSITest {
+    [DllImport("amsi.dll")]
+    public static extern int AmsiInitialize(string appName, out IntPtr amsiContext);
+}
+"@
+# Lab: Patch amsi.dll in memory
+"""
+    amsi_b64 = encode_file_content(amsi_src)
+
+    veh_src = """using System; using System.Threading;
+class FakeEDR {
+    static void Main() {
+        Console.WriteLine("[FakeEDR] Monitoring with VEH...");
+        while(true) { Thread.Sleep(1000); }
+    }
+}"""
+    veh_b64 = encode_file_content(veh_src)
+
+    msbuild_src = """<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Target Name="LOLBin"> <ClassExample /> </Target>
+  <UsingTask TaskName="ClassExample" TaskFactory="CodeTaskFactory" AssemblyFile="C:\\Windows\\Microsoft.Net\\Framework\\v4.0.30319\\Microsoft.Build.Tasks.v4.0.dll">
+    <Task> <Code Type="Class" Language="cs"> <![CDATA[
+      using System; using Microsoft.Build.Utilities;
+      public class ClassExample : Task { public override bool Execute() { Console.WriteLine("PWNED"); return true; } }
+    ]]> </Code> </Task>
+  </UsingTask>
+</Project>"""
+    msbuild_b64 = encode_file_content(msbuild_src)
+
+    # =========================================================================
+    # DC01 SCRIPT ARRAYS (VERBOSE LOGGING)
+    # =========================================================================
     
-    # 1. Base Setup
-    dc_base_script = [
+    dc_base = [
+        "Write-Host '>>> [1/5] Configuring Execution Policy...' -ForegroundColor Cyan",
         "Set-ExecutionPolicy Bypass -Scope Process -Force",
         "Set-MpPreference -DisableRealtimeMonitoring $true",
         "Rename-Computer -NewName 'DC01' -Force",
+        "Write-Host '>>> [2/5] Configuring Security Protocols...' -ForegroundColor Cyan",
         "[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072",
+        "Write-Host '>>> [3/5] Pre-authorizing NuGet (Anti-Hang)...' -ForegroundColor Cyan",
+        "Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force",
+        "Set-PSRepository -Name PSGallery -InstallationPolicy Trusted",
+        "Write-Host '>>> [4/5] Installing Chocolatey...' -ForegroundColor Cyan",
         "Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))"
     ]
 
-    # 2. Software (Retry Logic)
-    dc_soft_script = [
+    dc_soft = [
+        "Write-Host '>>> [1/7] Installing Git...' -ForegroundColor Cyan",
         "choco install git -y --no-progress",
+        "Write-Host '>>> [2/7] Installing SQL Server Express (This takes time)...' -ForegroundColor Cyan",
         "$max=3; $i=0; while($i -lt $max){ try { choco install sql-server-express -y --execution-timeout=3600; break } catch { $i++; Start-Sleep 10 } }",
         "if (-not (Get-Service 'MSSQL$SQLEXPRESS' -ErrorAction SilentlyContinue)) { Write-Error 'SQL Server install failed'; exit 1 }",
+        "Write-Host '>>> [3/7] Installing XAMPP...' -ForegroundColor Cyan",
         "choco install xampp -y --no-progress",
+        "Write-Host '>>> [4/7] Installing Apache Service...' -ForegroundColor Cyan",
         "C:\\xampp\\apache\\bin\\httpd.exe -k install",
-        # Move XAMPP to 8080
+        "Write-Host '>>> [5/7] Reconfiguring Apache to Port 8080...' -ForegroundColor Cyan",
         "(Get-Content 'C:\\xampp\\apache\\conf\\httpd.conf') -replace 'Listen 80', 'Listen 8080' | Set-Content 'C:\\xampp\\apache\\conf\\httpd.conf'",
         "(Get-Content 'C:\\xampp\\apache\\conf\\httpd.conf') -replace 'ServerName localhost:80', 'ServerName localhost:8080' | Set-Content 'C:\\xampp\\apache\\conf\\httpd.conf'",
+        "Write-Host '>>> [6/7] Starting Apache...' -ForegroundColor Cyan",
         "Start-Service 'Apache2.4'"
     ]
 
-    # 3. Domain Promo
-    dc_ad_script = [
+    dc_promo = [
+        "Write-Host '>>> [1/2] Installing AD DS Roles...' -ForegroundColor Cyan",
         "Install-WindowsFeature AD-Domain-Services -IncludeManagementTools",
-        "Install-WindowsFeature ADCS-Cert-Authority -IncludeManagementTools",
-        "Install-WindowsFeature ADCS-Web-Enrollment -IncludeManagementTools",
         "Import-Module ADDSDeployment",
+        "Write-Host '>>> [2/2] Promoting Domain Controller...' -ForegroundColor Cyan",
         "Install-ADDSForest -DomainName 'lab.local' -DomainNetbiosName 'LAB' -SafeModeAdministratorPassword (ConvertTo-SecureString 'Vulnerable123!' -AsPlainText -Force) -InstallDns:$true -NoRebootOnCompletion:$true -Force:$true"
     ]
 
-    # 4. AD CS Config
-    dc_adcs_script = [
+    dc_adcs = [
+        "Write-Host '>>> [1/4] Installing Certificate Services...' -ForegroundColor Cyan",
+        "Install-WindowsFeature ADCS-Cert-Authority -IncludeManagementTools",
+        "Install-WindowsFeature ADCS-Web-Enrollment -IncludeManagementTools",
         "Import-Module ActiveDirectory",
+        "Write-Host '>>> [2/4] Configuring CA...' -ForegroundColor Cyan",
         "try { Install-AdcsCertificationAuthority -CAType EnterpriseRootCa -CryptoProviderName 'RSA#Microsoft Software Key Storage Provider' -KeyLength 2048 -HashAlgorithmName SHA256 -CACommonName 'lab-DC01-CA' -Force } catch { Write-Host 'CA Exists' }",
+        "Write-Host '>>> [3/4] Configuring Web Enrollment...' -ForegroundColor Cyan",
         "try { Install-AdcsWebEnrollment -Force } catch { Write-Host 'Web Enrollment Exists' }",
-        # IIS on Port 80
+        "Write-Host '>>> [4/4] Verifying IIS Binding...' -ForegroundColor Cyan",
         "Get-WebBinding -Port 80 -Name 'Default Web Site' -Protocol http"
     ]
 
-    # 5. Core Vulns
-    dc_vuln_script = [
+    dc_vuln = [
+        "Write-Host '>>> [1/10] Installing SqlServer Module...' -ForegroundColor Cyan",
         "Install-Module -Name SqlServer -Force -AllowClobber",
+        "Write-Host '>>> [2/10] Configuring SQL Network...' -ForegroundColor Cyan",
         "$sqlPath = 'HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\*\\MSSQLServer\\SuperSocketNetLib\\Tcp\\IPAll'",
         "$tcpKey = Get-Item $sqlPath | Select-Object -First 1",
         "New-ItemProperty -Path $tcpKey.PSPath -Name 'TcpPort' -Value '1433' -PropertyType String -Force",
         "Stop-Service 'MSSQL$SQLEXPRESS' -Force; Start-Service 'MSSQL$SQLEXPRESS'",
-        # Users
+        "Write-Host '>>> [3/10] Creating Vulnerable Users...' -ForegroundColor Cyan",
         "New-ADUser -Name svc_sql -SamAccountName svc_sql -AccountPassword (ConvertTo-SecureString 'Password123!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "New-ADUser -Name svc_backup -SamAccountName svc_backup -AccountPassword (ConvertTo-SecureString 'Backup2024!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "New-ADUser -Name helpdesk -SamAccountName helpdesk -AccountPassword (ConvertTo-SecureString 'Help123!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
-        # Vulns
-        "Set-ADUser -Identity svc_backup -DoesNotRequirePreAuth $true",
+        "Write-Host '>>> [4/10] Setting User Vulnerabilities...' -ForegroundColor Cyan",
+        
+        # FIX: The following line replaces the broken "Set-ADUser -DoesNotRequirePreAuth" command
+        "$u = Get-ADUser -Identity svc_backup -Properties UserAccountControl; $u.UserAccountControl = $u.UserAccountControl -bor 4194304; Set-ADUser -Instance $u",
+        
         "Set-ADUser -Identity svc_sql -ServicePrincipalNames @{Add='MSSQLSvc/dc01.lab.local:1433'}",
-        # DB Setup
+        "Write-Host '>>> [5/10] Creating SQL Database...' -ForegroundColor Cyan",
         "Invoke-Sqlcmd -Query \"CREATE DATABASE HR_DB;\" -ServerInstance 'localhost\\SQLEXPRESS'",
         "Invoke-Sqlcmd -Query \"USE HR_DB; CREATE TABLE Employees (ID INT, Name VARCHAR(100), Salary INT, SSN VARCHAR(20)); INSERT INTO Employees VALUES (1, 'Alice Manager', 90000, '000-00-1234'), (2, 'Bob User', 50000, '000-00-5678');\" -ServerInstance 'localhost\\SQLEXPRESS'",
+        "Write-Host '>>> [6/10] Creating SQL Login...' -ForegroundColor Cyan",
         "Invoke-Sqlcmd -Query \"CREATE LOGIN [LAB\\svc_sql] FROM WINDOWS; USE HR_DB; CREATE USER [LAB\\svc_sql] FOR LOGIN [LAB\\svc_sql]; ALTER ROLE [db_owner] ADD MEMBER [LAB\\svc_sql];\" -ServerInstance 'localhost\\SQLEXPRESS'",
-        # PHP Portal (ODBC)
+        "Write-Host '>>> [7/10] Deploying PHP Portal...' -ForegroundColor Cyan",
         "New-Item -Path 'C:\\xampp\\htdocs\\hr_portal' -ItemType Directory -Force",
         "(Get-Content 'C:\\xampp\\php\\php.ini') -replace ';extension=odbc', 'extension=odbc' | Set-Content 'C:\\xampp\\php\\php.ini'",
-        "$php = @\"",
-        "<?php",
-        "  $server = 'localhost\\SQLEXPRESS';",
-        "  $conn = odbc_connect(\"Driver={SQL Server};Server=$server;Database=HR_DB\", 'LAB\\svc_sql', 'Password123!');",
-        "  $id = $_GET['id'];",
-        "  if (!$conn) { die('Connection failed: ' . odbc_errormsg()); }",
-        "  $sql = \"SELECT Name, Salary FROM Employees WHERE ID = \" . $id;",
-        "  $result = odbc_exec($conn, $sql);",
-        "  if(!$result) { die('Query failed'); }",
-        "  while($row = odbc_fetch_array($result)) { echo 'Name: '.$row['Name'].'<br>'; }",
-        "?>",
-        "\"@",
+        f"$php = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{php_b64}'))",
         "Set-Content -Path 'C:\\xampp\\htdocs\\hr_portal\\index.php' -Value $php",
-        # Fake Cloud
+        "Write-Host '>>> [8/10] Planting Fake Cloud Config...' -ForegroundColor Cyan",
         "New-Item -Path 'C:\\Program Files\\Azure AD Sync' -ItemType Directory -Force",
-        "$xml = @\"",
-        "<AzureADSyncConfig><PasswordEncrypted>VABhAGwAbABoAGEAbABsAGEAMQAyADMAIQ==</PasswordEncrypted></AzureADSyncConfig>",
-        "\"@",
+        f"$xml = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{xml_b64}'))",
         "Set-Content -Path 'C:\\Program Files\\Azure AD Sync\\connection.xml' -Value $xml",
-        # Firewall
+        "Write-Host '>>> [9/10] Configuring Firewall...' -ForegroundColor Cyan",
         "New-NetFirewallRule -DisplayName 'Allow HTTP' -Direction Inbound -LocalPort 80 -Protocol TCP -Action Allow",
         "New-NetFirewallRule -DisplayName 'Allow HTTP 8080' -Direction Inbound -LocalPort 8080 -Protocol TCP -Action Allow",
         "New-NetFirewallRule -DisplayName 'Allow MSSQL' -Direction Inbound -LocalPort 1433 -Protocol TCP -Action Allow",
         "New-NetFirewallRule -DisplayName 'Allow RDP' -Direction Inbound -LocalPort 3389 -Protocol TCP -Action Allow"
     ]
 
-    # 6. Advanced Scenarios
-    dc_adv_script = [
-        "Write-Host '>>> DEPLOYING ADVANCED SCENARIOS...'",
+    dc_adv = [
+        "Write-Host '>>> [1/7] Initializing .NET Compiler...' -ForegroundColor Cyan",
         "$csc = 'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe'",
-        # AMSI
+        "Write-Host '>>> [2/7] Deploying AMSI Bypass Lab...' -ForegroundColor Cyan",
         "New-Item -Path 'C:\\Tools\\AMSILab' -ItemType Directory -Force",
-        "$amsi = @\"",
-        "Add-Type -TypeDefinition @'",
-        "using System; using System.Runtime.InteropServices;",
-        "public class AMSITest { [DllImport(\"amsi.dll\")] public static extern int AmsiInitialize(string appName, out IntPtr ctx); }",
-        "'@",
-        "\"@",
+        f"$amsi = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{amsi_b64}'))",
         "Set-Content -Path 'C:\\Tools\\AMSILab\\vuln.ps1' -Value $amsi",
-        # VEH
+        "$acl = Get-Acl 'HKLM:\\SOFTWARE\\Microsoft\\AMSI\\Providers'",
+        "$rule = New-Object System.Security.AccessControl.RegistryAccessRule('BUILTIN\\Users','FullControl','Allow')",
+        "$acl.SetAccessRule($rule)",
+        "Set-Acl 'HKLM:\\SOFTWARE\\Microsoft\\AMSI\\Providers' $acl",
+        "Write-Host '>>> [3/7] Compiling VEH Bypass Lab...' -ForegroundColor Cyan",
         "New-Item -Path 'C:\\Tools\\VEHLab' -ItemType Directory -Force",
-        "$veh = @\"",
-        "using System; using System.Threading;",
-        "class FakeEDR { static void Main() { Console.WriteLine(\"FakeEDR Running...\"); while(true) Thread.Sleep(1000); } }",
-        "\"@",
+        f"$veh = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{veh_b64}'))",
         "Set-Content -Path 'C:\\Tools\\VEHLab\\FakeEDR.cs' -Value $veh",
         "Invoke-Expression \"& $csc /out:C:\\Tools\\VEHLab\\FakeEDR.exe C:\\Tools\\VEHLab\\FakeEDR.cs\"",
-        # Creds
+        "Write-Host '>>> [4/7] Creating Credential Dumps...' -ForegroundColor Cyan",
         "New-Item -Path 'C:\\Tools\\CredLab' -ItemType Directory -Force",
+        "cmdkey /add:fileserver.lab.local /user:LAB\\backup_admin /pass:BackupP@ss123!",
         "reg save HKLM\\SAM C:\\Tools\\CredLab\\SAM.bak",
         "reg save HKLM\\SYSTEM C:\\Tools\\CredLab\\SYSTEM.bak",
-        "reg save HKLM\\SECURITY C:\\Tools\\CredLab\\SECURITY.bak"
+        "reg save HKLM\\SECURITY C:\\Tools\\CredLab\\SECURITY.bak",
+        "Write-Host '>>> [5/7] Deploying LOLBins...' -ForegroundColor Cyan",
+        "New-Item -Path 'C:\\Tools\\LOLBinLab' -ItemType Directory -Force",
+        f"$proj = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{msbuild_b64}'))",
+        "Set-Content -Path 'C:\\Tools\\LOLBinLab\\payload.csproj' -Value $proj",
+        "Write-Host '>>> [6/7] Enabling Logging...' -ForegroundColor Cyan",
+        "New-Item -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging' -Force",
+        "Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging' -Name 'EnableScriptBlockLogging' -Value 1",
+        "Write-Host '>>> [7/7] Configuring Persistence...' -ForegroundColor Cyan",
+        "New-Item -Path 'C:\\Tools\\PersistenceLab' -ItemType Directory -Force",
+        "Unregister-ScheduledTask -TaskName 'WindowsDefenderUpdate' -Confirm:$false -ErrorAction SilentlyContinue",
+        "$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-WindowStyle Hidden -Command \"echo persistence > C:\\Windows\\Temp\\persist.txt\"'",
+        "$trigger = New-ScheduledTaskTrigger -AtLogOn",
+        "$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest",
+        "Register-ScheduledTask -TaskName 'WindowsDefenderUpdate' -Action $action -Trigger $trigger -Principal $principal"
     ]
 
-    # 7. IP Staging
-    dc_ip_script = [
+    dc_ip = [
         "Unregister-ScheduledTask -TaskName 'SetStaticIP' -Confirm:$false -ErrorAction SilentlyContinue",
         "$lines = @(",
         "  '$ip = ''10.0.0.10''',",
@@ -386,11 +476,13 @@ d-i finish-install/reboot_in_progress note
         "Register-ScheduledTask -Action $action -Trigger $trigger -TaskName 'SetStaticIP' -User 'SYSTEM' -RunLevel Highest"
     ]
 
+    iso_path_win = (BASE_DIR / WS2022_TARGET_NAME).as_uri()
+    
     with open(BASE_DIR / "dc01.pkr.hcl", "w") as f:
         f.write(f"""
 source "virtualbox-iso" "dc01" {{
   cpus                 = 2
-  memory               = 6144
+  memory               = {ram_mb}
   disk_size            = 81920
   iso_checksum         = "none"
   headless             = false
@@ -414,38 +506,37 @@ source "virtualbox-iso" "dc01" {{
 
 build {{
   sources = ["source.virtualbox-iso.dc01"]
-  provisioner "powershell" {{ inline = {to_hcl(dc_base_script)} }}
+  provisioner "powershell" {{ inline = {to_hcl(dc_base)} }}
   provisioner "windows-restart" {{ restart_timeout = "15m" }}
-  provisioner "powershell" {{ inline = {to_hcl(dc_soft_script)} }}
+  provisioner "powershell" {{ inline = {to_hcl(dc_soft)} }}
   provisioner "windows-restart" {{ restart_timeout = "15m" }}
-  provisioner "powershell" {{ inline = {to_hcl(dc_ad_script)} }}
+  # DC PROMO FIRST (NO ADCS)
+  provisioner "powershell" {{ inline = {to_hcl(dc_promo)} }}
   provisioner "windows-restart" {{ restart_timeout = "30m" }}
-  provisioner "powershell" {{ inline = {to_hcl(dc_adcs_script)} }}
-  provisioner "powershell" {{ inline = {to_hcl(dc_vuln_script)} }}
-  provisioner "powershell" {{ inline = {to_hcl(dc_adv_script)} }}
-  provisioner "powershell" {{ inline = {to_hcl(dc_ip_script)} }}
+  # ADCS AFTER REBOOT
+  provisioner "powershell" {{ inline = {to_hcl(dc_adcs)} }}
+  provisioner "powershell" {{ inline = {to_hcl(dc_vuln)} }}
+  provisioner "powershell" {{ inline = {to_hcl(dc_adv)} }}
+  provisioner "powershell" {{ inline = {to_hcl(dc_ip)} }}
 }}
 """)
 
     # =========================================================================
-    # GENERATE WEB01.PKR.HCL
+    # WEB01 GENERATION
     # =========================================================================
     iso_path_deb = (BASE_DIR / DEBIAN_TARGET_NAME).as_uri()
 
-    web_base_script = [
+    web_base = [
         "sudo apt-get update",
         "sudo apt-get install -y curl gnupg net-tools python3-flask python3-pip gcc make libcap2-bin vim auditd audispd-plugins samba",
-        # Docker
         "curl -fsSL https://get.docker.com -o get-docker.sh",
         "sudo sh get-docker.sh",
         "sudo usermod -aG docker vagrant",
         "sudo systemctl enable docker; sudo systemctl start docker",
-        # K3s
         "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='--disable=traefik' sh -",
         "mkdir -p /home/vagrant/.kube",
         "sudo cp /etc/rancher/k3s/k3s.yaml /home/vagrant/.kube/config",
         "sudo chown vagrant:vagrant /home/vagrant/.kube/config",
-        # Samba
         "echo '[share]' | sudo tee -a /etc/samba/smb.conf",
         "echo 'path = /home/vagrant/share' | sudo tee -a /etc/samba/smb.conf",
         "echo 'read only = no' | sudo tee -a /etc/samba/smb.conf",
@@ -453,7 +544,7 @@ build {{
         "sudo systemctl restart smbd"
     ]
 
-    web_ai_script = [
+    web_ai = [
         "mkdir -p /home/vagrant/ai_agent",
         r'printf "from flask import Flask, request\nimport subprocess\napp = Flask(__name__)\n@app.route(\"/\")\ndef home(): return \"Insecure AI\"\n@app.route(\"/ask\")\ndef ask():\n    q = request.args.get(\"query\", \"\")\n    try:\n        out = subprocess.check_output(q, shell=True, stderr=subprocess.STDOUT)\n        return f\"<pre>{out.decode()}</pre>\"\n    except Exception as e: return str(e)\nif __name__ == \"__main__\": app.run(host=\"0.0.0.0\", port=5000)\n" > /home/vagrant/ai_agent/app.py',
         r'printf "[Unit]\nDescription=AI\nAfter=network.target\n[Service]\nUser=root\nWorkingDirectory=/home/vagrant/ai_agent\nExecStart=/usr/bin/python3 app.py\nRestart=always\n[Install]\nWantedBy=multi-user.target\n" | sudo tee /etc/systemd/system/ai_agent.service',
@@ -462,7 +553,7 @@ build {{
         "sudo systemctl start ai_agent"
     ]
 
-    web_api_script = [
+    web_api = [
         "sudo docker run -d --restart unless-stopped -p 3000:3000 bkimminich/juice-shop",
         "sudo docker run -d --restart unless-stopped -p 5002:80 roottusk/vapi",
         "mkdir -p ~/crapi",
@@ -470,27 +561,27 @@ build {{
         "curl -o docker-compose.yml https://raw.githubusercontent.com/OWASP/crAPI/v1.0.0/deploy/docker/docker-compose.yml",
         "sudo docker compose pull",
         "sudo docker compose -f docker-compose.yml up -d || echo 'Docker Compose Failed'",
-        # Network
         "IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -1)",
         "echo \"auto $IFACE\" | sudo tee -a /etc/network/interfaces",
         "echo \"iface $IFACE inet static\" | sudo tee -a /etc/network/interfaces",
         "echo '  address 10.0.0.20/24' | sudo tee -a /etc/network/interfaces"
     ]
 
-    web_adv_script = [
+    web_adv = [
         "mkdir -p /home/vagrant/container_lab",
         r'printf "version: \"3\"\nservices:\n  vuln_priv:\n    image: ubuntu:latest\n    privileged: true\n    command: sleep infinity\n  vuln_sock:\n    image: ubuntu:latest\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n    command: sleep infinity\n" > /home/vagrant/container_lab/docker-compose-vuln.yml',
         "cd /home/vagrant/container_lab && sudo docker compose -f docker-compose-vuln.yml up -d || exit 1",
-        # K8s
         "echo 'Waiting for K3s...'",
         "until sudo kubectl get nodes 2>/dev/null | grep -q ' Ready'; do sleep 5; done",
         "mkdir -p /home/vagrant/k8s_lab",
-        r'printf "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: vuln-sa\n  namespace: default\n---\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nmetadata:\n  name: vuln-binding\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: ClusterRole\n  name: cluster-admin\nsubjects:\n- kind: ServiceAccount\n  name: vuln-sa\n  namespace: default\n" > /home/vagrant/k8s_lab/vuln.yaml',
-        "sudo kubectl apply -f /home/vagrant/k8s_lab/vuln.yaml",
-        # PrivEsc
+        r'printf "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: vuln-admin-sa\n  namespace: default\n---\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nmetadata:\n  name: vuln-binding\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: ClusterRole\n  name: cluster-admin\nsubjects:\n- kind: ServiceAccount\n  name: vuln-admin-sa\n  namespace: default\n" > /home/vagrant/k8s_lab/vuln-sa.yaml',
+        "sudo kubectl apply -f /home/vagrant/k8s_lab/vuln-sa.yaml",
         "echo 'vagrant ALL=(ALL) NOPASSWD: /usr/bin/vim' | sudo tee -a /etc/sudoers.d/vuln_sudo",
         "sudo cp /usr/bin/python3 /usr/local/bin/python_cap",
-        "sudo setcap cap_setuid+ep /usr/local/bin/python_cap"
+        "sudo setcap cap_setuid+ep /usr/local/bin/python_cap",
+        "mkdir -p /home/vagrant/exfil_lab",
+        "echo 'API_KEY=sk_live_1234567890abcdef' > /home/vagrant/exfil_lab/.env",
+        "echo 'AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE' >> /home/vagrant/exfil_lab/.env"
     ]
 
     with open(BASE_DIR / "web01.pkr.hcl", "w") as f:
@@ -525,10 +616,10 @@ source "virtualbox-iso" "web01" {{
 
 build {{
   sources = ["source.virtualbox-iso.web01"]
-  provisioner "shell" {{ inline = {to_hcl(web_base_script)} }}
-  provisioner "shell" {{ inline = {to_hcl(web_ai_script)} }}
-  provisioner "shell" {{ inline = {to_hcl(web_api_script)} }}
-  provisioner "shell" {{ inline = {to_hcl(web_adv_script)} }}
+  provisioner "shell" {{ inline = {to_hcl(web_base)} }}
+  provisioner "shell" {{ inline = {to_hcl(web_ai)} }}
+  provisioner "shell" {{ inline = {to_hcl(web_api)} }}
+  provisioner "shell" {{ inline = {to_hcl(web_adv)} }}
 }}
 """)
 
@@ -537,10 +628,9 @@ build {{
 # ============================================================================
 def main():
     print_color("==================================================================", Colors.CYAN)
-    print_color("        MODERN KILL LAB - MASTER BUILDER (Auto-Install)           ", Colors.CYAN)
+    print_color("        MODERN KILL LAB - MASTER BUILDER (v5.3 Syntax Fix)        ", Colors.CYAN)
     print_color("==================================================================", Colors.CYAN)
     
-    # 1. DEPENDENCY CHECK
     dm = DependencyManager()
     print(f"Platform: {dm.os_type}")
     if not dm.check_packer(): return
@@ -553,7 +643,6 @@ def main():
     (BASE_DIR / "http").mkdir(exist_ok=True)
     os.chdir(BASE_DIR)
 
-    # 2. ISO CHECKS
     ws2022_path = BASE_DIR / WS2022_TARGET_NAME
     if not ws2022_path.exists():
         print_color(f"\n[-] '{WS2022_TARGET_NAME}' is missing.", Colors.YELLOW)
@@ -566,11 +655,9 @@ def main():
         download_file(DEBIAN_URL, debian_path)
     else: print_color(f"    [CHECK] {DEBIAN_TARGET_NAME} found.", Colors.GREEN)
 
-    # 3. VM CHECKS
     nuke_vm("Lab-DC01")
     nuke_vm("Lab-Web01")
     
-    # 4. BUILD
     generate_files()
     print_color("\n>>> STARTING PACKER BUILDS...", Colors.YELLOW)
     subprocess.run(["packer", "init", "."], shell=(dm.os_type=="Windows"))
@@ -581,7 +668,6 @@ def main():
     print_color("\n    [BUILD] Web01...", Colors.CYAN)
     subprocess.call(["packer", "build", "-force", "web01.pkr.hcl"], shell=(dm.os_type=="Windows"))
 
-    # 5. NETWORKING
     vbox_cmd = "VBoxManage"
     if dm.os_type == "Windows" and not shutil.which("VBoxManage"):
         vbox_cmd = r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
@@ -590,7 +676,6 @@ def main():
     for vm in ["Lab-DC01", "Lab-Web01"]:
         subprocess.run([vbox_cmd, "modifyvm", vm, "--nic1", "intnet", "--intnet1", "psycholab"], stderr=subprocess.DEVNULL)
 
-    # 6. SUMMARY
     print_color("\n==================================================================", Colors.CYAN)
     print_color("                  LAB ACCESS CREDENTIALS                          ", Colors.CYAN)
     print_color("==================================================================", Colors.CYAN)
