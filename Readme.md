@@ -1,44 +1,113 @@
-# Modernized Kill Lab - Master Builder
+# ☠️ PROJECT: MODERN KILL LAB (MKL)
+### Automated Cyber Range Deployment System // v2.0.0
 
-## Overview
-This Python script (`master_build.py`) is a fully automated "Infrastructure as Code" tool designed to deploy a complex, vulnerable cybersecurity training range. It replaces manual setup by automatically detecting your OS, downloading necessary ISOs, and instructing **Packer** and **VirtualBox** to build two highly configured virtual machines.
+![Build Status](https://img.shields.io/badge/Build-PASSING-brightgreen?style=for-the-badge&logo=github)
+![Platform](https://img.shields.io/badge/Platform-CROSS--PLATFORM-blueviolet?style=for-the-badge&logo=linux)
+![Security Level](https://img.shields.io/badge/Security-OFFENSIVE-red?style=for-the-badge&logo=kali-linux)
+![Author](https://img.shields.io/badge/Operator-NEURAL_PHANTOM-orange?style=for-the-badge)
 
-## 🛠️ What The Script Does
+```text
+ █▀▄▀█ █▀▀█ █▀▀▄ █▀▀ █▀▀█ █▀▀▄    █ █ █ █ █    █      █▀▀█ █▀▀▄ 
+ █ ▀ █ █  █ █  █ █▀▀ █▄▄█ █▄▄▀    █▄▀▄█ █ █    █      █▄▄█ █▀▀▄ 
+ ▀   ▀ ▀▀▀▀ ▀▀▀  ▀▀▀ ▀  ▀ ▀  ▀    ▀   ▀ ▀ ▀▄▄  █▄▄▄   ▀  ▀ ▀▀▀  
+```
 
-### 1. Automated Infrastructure Management
-* **OS Detection:** Identifies if you are running Windows, macOS (Intel), or Linux.
-* **Dependency Handling:** Checks for **VirtualBox** and **Packer**. If missing, it offers to install them using your system's native package manager (`winget`, `brew`, `apt`, `pacman`, etc.).
-* **ISO Management:**
-    * Automatically downloads **Windows Server 2022 Evaluation** and **Debian 12** directly from official sources.
-    * Enforces correct filenames (`ws2022.iso`, `debian.iso`) to ensure build compatibility.
-    * Includes a manual fallback prompt if automatic downloads fail.
+---
 
-### 2. "Lab-DC01" (The Target Domain Controller)
-Builds a Windows Server 2022 Domain Controller (`10.0.0.10`) with the following features:
-* **Active Directory:** Promoted to DC for the `LAB.local` domain.
-* **Vulnerable SQL Server:** Installs SQL Server Express with `sa` disabled but a weak service account (`LAB\svc_sql`) configured.
-* **Legacy HR Portal (SQLi):** Deploys a custom PHP application on XAMPP that contains a classic **SQL Injection** vulnerability connected directly to the `HR_DB` database.
-* **AD CS (Certificate Services):** Installs Active Directory Certificate Services with **Web Enrollment** enabled, opening the door for NTLM Relay attacks (ESC8).
-* **Fake Cloud Identity:** Plants a decoy "Azure AD Sync" configuration file containing a reversible encrypted password, mimicking a common Hybrid Identity lateral movement path.
+## MISSION BRIEFING
 
-### 3. "Lab-Web01" (The Modern Application Server)
-Builds a Debian 12 Linux server (`10.0.0.20`) focused on modern appsec:
-* **Kubernetes (K3s):** Installs a lightweight Kubernetes cluster for container orchestration testing.
-* **Insecure AI Agent:** Deploys a custom Python/Flask application simulating an internal AI tool vulnerable to **Prompt Injection** and **Remote Code Execution (RCE)**.
-* **API Security Targets:** Runs Docker containers for **vAPI** (Vulnerable API), **crAPI**, and **OWASP Juice Shop**.
+**Modern Kill Lab (MKL)** is a weaponized "Infrastructure-as-Code" deployment tool. It abandons legacy lab setups in favor of Hybrid Identity, AI-driven vulnerabilities, and Kubernetes attack vectors.
 
-### 4. Networking & Cleanup
-* **Isolation:** Configures a private Host-Only network (`psycholab`) so VMs can communicate safely without exposing them to the open internet.
-* **Idempotency:** Checks for existing VMs and offers to "nuke" (delete) them before starting a fresh build.
+This script does not just "install VMs." It orchestrates a hostile environment designed to test your skills against current TTPs (Tactics, Techniques, and Procedures).
 
-## 📋 Requirements
-To run this script successfully, you need:
-* **Python 3:** Installed on your host machine.
-* **Virtualization Support:** VT-x/AMD-V enabled in BIOS/UEFI.
-* **Disk Space:** ~100GB free (for ISOs + uncompressed VM disks).
-* **RAM:** 16GB recommended (8GB minimum).
-* **Internet:** Required for downloading ISOs and packages.
+---
 
-## 🚀 Usage
+## 🏗️ ARSENAL (What Gets Built)
+
+### 🎯 TARGET ALPHA: Lab-DC01 (The Stronghold)
+
+| Property | Value |
+|----------|-------|
+| **OS** | Windows Server 2022 (Evaluation) |
+| **Role** | Domain Controller (LAB.local) |
+
+**Vulnerability Matrix:**
+
+| Severity | Vulnerability |
+|----------|---------------|
+| `CRITICAL` | **AD CS Web Enrollment:** Misconfigured Certificate Authority vulnerable to NTLM Relay (ESC8). |
+| `HIGH` | **Legacy HR Portal:** Custom PHP app with blind & error-based SQL Injection. |
+| `HIGH` | **Hybrid Identity Bait:** Decoy "Azure AD Connect" config with reversible credentials. |
+| `MEDIUM` | **Weak Service Accounts:** `LAB\svc_sql` running privileged services. |
+
+---
+
+### 🎯 TARGET BRAVO: Lab-Web01 (The Modern Surface)
+
+| Property | Value |
+|----------|-------|
+| **OS** | Debian 12 (Bookworm) |
+| **Role** | AppSec & Container Host |
+
+**Vulnerability Matrix:**
+
+| Severity | Vulnerability |
+|----------|---------------|
+| `CRITICAL` | **Insecure AI Agent:** Internal LLM tool vulnerable to Prompt Injection & RCE. |
+| `HIGH` | **Unsecured Kubernetes:** K3s cluster with default configs. |
+| `HIGH` | **vAPI & crAPI:** Broken Object Level Auth (BOLA) and Mass Assignment labs. |
+| `MEDIUM` | **Juice Shop:** The gold standard for OWASP Top 10 training. |
+
+---
+
+## ⚡ DEPLOYMENT PROTOCOL
+
+### 1. Prerequisites
+
+| Requirement | Specification |
+|-------------|---------------|
+| **Hardware** | 16GB RAM / 100GB Disk / VT-x Enabled CPU |
+| **Software** | Python 3.x installed |
+| **Network** | Unrestricted internet access (for ISO/Package retrieval) |
+
+### 2. Execution
+
+Clone the repo, navigate to the directory, and execute the master builder.
+
 ```bash
+# Initialize the build sequence
 python3 master_build.py
+```
+
+### 3. Automated Sequence
+
+1. **Recon:** Script detects OS (Windows/Linux/macOS) and hunts for dependencies.
+2. **Acquisition:** Auto-downloads Windows Server 2022 & Debian ISOs (forced naming convention).
+3. **Construction:** Packer spins up headless VirtualBox instances and injects the vulnerable configuration.
+4. **Networking:** Deploys a private air-gapped network (`psycholab`) to contain the threat.
+
+---
+
+## 💀 KILL CHAIN ACCESS
+
+| SYSTEM | IP ADDRESS | SERVICE | CREDENTIALS |
+|--------|------------|---------|-------------|
+| Lab-DC01 | `10.0.0.10` | RDP / WinRM | `LAB\vagrant` / `Vagrant!123` |
+| | | SQL DB | `LAB\svc_sql` / `Password123!` |
+| | | HR Portal | `http://10.0.0.10/hr_portal` |
+| | | AD CS | `http://10.0.0.10/certsrv` |
+| Lab-Web01 | `10.0.0.20` | SSH | `vagrant` / `vagrant` |
+| | | AI Agent | `http://10.0.0.20:5000` |
+| | | vAPI | `http://10.0.0.20:5002` |
+
+---
+
+## ⚠️ DISCLAIMER
+
+> **Authorized for educational use and authorized penetration testing only.**
+
+This lab environment is designed for learning offensive security techniques in a safe, isolated environment. Do not use these techniques against systems you do not own or have explicit written permission to test.
+
+---
+
+**Happy Hunting.** 🎯
