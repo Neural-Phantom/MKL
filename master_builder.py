@@ -11,19 +11,17 @@ import ctypes
 from pathlib import Path
 
 # --- CONFIGURATION ---
-# Detect home correctly even if sudo is accidentally preserved
 HOME_DIR = Path(os.path.expanduser("~"))
 BASE_DIR = HOME_DIR / "ModernHackingLab"
 
 # 1. ISO CONFIGURATION
-# Checksums removed to prevent mirror mismatch errors
 WS2022_TARGET_NAME = "ws2022.iso"
 WS2022_URL = "https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso"
 WS2022_CHECKSUM = "none"
 
 DEBIAN_TARGET_NAME = "debian.iso"
 DEBIAN_URL = "https://cdimage.debian.org/cdimage/archive/12.5.0/amd64/iso-cd/debian-12.5.0-amd64-netinst.iso"
-DEBIAN_CHECKSUM = "none" 
+DEBIAN_CHECKSUM = "none"
 
 class Colors:
     HEADER = '\033[95m'
@@ -49,13 +47,11 @@ def check_privileges():
                 print("Please right-click and 'Run as Administrator'.")
                 sys.exit(1)
         else:
-            # Linux/Mac check: MUST NOT BE ROOT
             if os.geteuid() == 0:
                 print_color("\n[CRITICAL] DO NOT RUN AS ROOT", Colors.FAIL)
                 print("VirtualBox will crash if run with sudo.")
                 print("Please run as your standard user:")
                 print(f"    python3 {os.path.basename(__file__)}")
-                print("(The script will ask for sudo password only when installing packages)")
                 sys.exit(1)
     except Exception as e:
         pass
@@ -87,7 +83,6 @@ def get_optimal_ram_mb():
                             total_ram_mb = int(line.split()[1]) // 1024
                             break
     except: pass
-    
     target = int(total_ram_mb * 0.5)
     return max(4096, min(8192, target))
 
@@ -221,7 +216,6 @@ def download_file(url, dest_path):
 # ============================================================================
 def generate_files():
     print_color("\n>>> GENERATING CONFIGURATION FILES...", Colors.YELLOW)
-    
     ram_mb = get_optimal_ram_mb()
     print_color(f"    [CONFIG] Optimized RAM Allocation: {ram_mb} MB", Colors.GREEN)
 
@@ -371,7 +365,7 @@ class FakeEDR {
     msbuild_b64 = encode_file_content(msbuild_src)
 
     # =========================================================================
-    # DC01 SCRIPT ARRAYS (VERBOSE LOGGING)
+    # DC01 SCRIPT ARRAYS (FIXED SSL ERROR)
     # =========================================================================
     
     dc_base = [
@@ -439,18 +433,16 @@ class FakeEDR {
         "New-ADUser -Name svc_backup -SamAccountName svc_backup -AccountPassword (ConvertTo-SecureString 'Backup2024!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "New-ADUser -Name helpdesk -SamAccountName helpdesk -AccountPassword (ConvertTo-SecureString 'Help123!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "Write-Host '>>> [4/10] Setting User Vulnerabilities...' -ForegroundColor Cyan",
-        
-        # FIXED: AS-REP Roasting via ADSI (Direct LDAP Modification)
         "$u = [ADSI]'LDAP://CN=svc_backup,CN=Users,DC=lab,DC=local'",
         "$u.userAccountControl = $u.userAccountControl.Value -bor 4194304",
         "$u.SetInfo()",
-        
         "Set-ADUser -Identity svc_sql -ServicePrincipalNames @{Add='MSSQLSvc/dc01.lab.local:1433'}",
         "Write-Host '>>> [5/10] Creating SQL Database...' -ForegroundColor Cyan",
-        "Invoke-Sqlcmd -Query \"CREATE DATABASE HR_DB;\" -ServerInstance 'localhost\\SQLEXPRESS'",
-        "Invoke-Sqlcmd -Query \"USE HR_DB; CREATE TABLE Employees (ID INT, Name VARCHAR(100), Salary INT, SSN VARCHAR(20)); INSERT INTO Employees VALUES (1, 'Alice Manager', 90000, '000-00-1234'), (2, 'Bob User', 50000, '000-00-5678');\" -ServerInstance 'localhost\\SQLEXPRESS'",
+        # FIXED: Added -TrustServerCertificate to all Invoke-Sqlcmd calls
+        "Invoke-Sqlcmd -Query \"CREATE DATABASE HR_DB;\" -ServerInstance 'localhost\\SQLEXPRESS' -TrustServerCertificate",
+        "Invoke-Sqlcmd -Query \"USE HR_DB; CREATE TABLE Employees (ID INT, Name VARCHAR(100), Salary INT, SSN VARCHAR(20)); INSERT INTO Employees VALUES (1, 'Alice Manager', 90000, '000-00-1234'), (2, 'Bob User', 50000, '000-00-5678');\" -ServerInstance 'localhost\\SQLEXPRESS' -TrustServerCertificate",
         "Write-Host '>>> [6/10] Creating SQL Login...' -ForegroundColor Cyan",
-        "Invoke-Sqlcmd -Query \"CREATE LOGIN [LAB\\svc_sql] FROM WINDOWS; USE HR_DB; CREATE USER [LAB\\svc_sql] FOR LOGIN [LAB\\svc_sql]; ALTER ROLE [db_owner] ADD MEMBER [LAB\\svc_sql];\" -ServerInstance 'localhost\\SQLEXPRESS'",
+        "Invoke-Sqlcmd -Query \"CREATE LOGIN [LAB\\svc_sql] FROM WINDOWS; USE HR_DB; CREATE USER [LAB\\svc_sql] FOR LOGIN [LAB\\svc_sql]; ALTER ROLE [db_owner] ADD MEMBER [LAB\\svc_sql];\" -ServerInstance 'localhost\\SQLEXPRESS' -TrustServerCertificate",
         "Write-Host '>>> [7/10] Deploying PHP Portal...' -ForegroundColor Cyan",
         "New-Item -Path 'C:\\xampp\\htdocs\\hr_portal' -ItemType Directory -Force",
         "(Get-Content 'C:\\xampp\\php\\php.ini') -replace ';extension=odbc', 'extension=odbc' | Set-Content 'C:\\xampp\\php\\php.ini'",
@@ -570,7 +562,7 @@ build {{
 """)
 
     # =========================================================================
-    # WEB01 GENERATION
+    # WEB01 GENERATION (FIXED 404 & RATE LIMITS)
     # =========================================================================
     iso_path_deb = (BASE_DIR / DEBIAN_TARGET_NAME).as_uri()
 
@@ -604,10 +596,13 @@ build {{
 
     web_api = [
         "sudo docker run -d --restart unless-stopped -p 3000:3000 bkimminich/juice-shop",
+        "sleep 10",
         "sudo docker run -d --restart unless-stopped -p 5002:80 roottusk/vapi",
+        "sleep 10",
         "mkdir -p ~/crapi",
         "cd ~/crapi",
-        "curl -o docker-compose.yml https://raw.githubusercontent.com/OWASP/crAPI/v1.0.0/deploy/docker/docker-compose.yml",
+        # FIXED: URL pointing to 'main' instead of 'v1.0.0' (404 fix)
+        "curl -o docker-compose.yml https://raw.githubusercontent.com/OWASP/crAPI/main/deploy/docker/docker-compose.yml",
         "sudo docker compose pull",
         "sudo docker compose -f docker-compose.yml up -d || echo 'Docker Compose Failed'",
         "IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -1)",
@@ -679,7 +674,7 @@ def main():
     check_privileges()
     
     print_color("==================================================================", Colors.CYAN)
-    print_color("        MODERN KILL LAB - MASTER BUILDER (v7.2 Stability)         ", Colors.CYAN)
+    print_color("        MODERN KILL LAB - MASTER BUILDER (v8.0 Gold Master)       ", Colors.CYAN)
     print_color("==================================================================", Colors.CYAN)
     
     dm = DependencyManager()
@@ -694,6 +689,7 @@ def main():
     (BASE_DIR / "http").mkdir(exist_ok=True)
     os.chdir(BASE_DIR)
 
+    # 2. ISO CHECKS
     ws2022_path = BASE_DIR / WS2022_TARGET_NAME
     if not ws2022_path.exists():
         print_color(f"\n[-] '{WS2022_TARGET_NAME}' is missing.", Colors.YELLOW)
@@ -706,9 +702,11 @@ def main():
         download_file(DEBIAN_URL, debian_path)
     else: print_color(f"    [CHECK] {DEBIAN_TARGET_NAME} found.", Colors.GREEN)
 
+    # 3. CLEANUP
     nuke_vm("Lab-DC01")
     nuke_vm("Lab-Web01")
     
+    # 4. BUILD
     generate_files()
     print_color("\n>>> STARTING PACKER BUILDS...", Colors.YELLOW)
     subprocess.run(["packer", "init", "."], shell=(dm.os_type=="Windows"))
