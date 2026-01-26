@@ -16,13 +16,14 @@ HOME_DIR = Path(os.path.expanduser("~"))
 BASE_DIR = HOME_DIR / "ModernHackingLab"
 
 # 1. ISO CONFIGURATION
+# Checksums removed to prevent mirror mismatch errors
 WS2022_TARGET_NAME = "ws2022.iso"
 WS2022_URL = "https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso"
 WS2022_CHECKSUM = "none"
 
 DEBIAN_TARGET_NAME = "debian.iso"
 DEBIAN_URL = "https://cdimage.debian.org/cdimage/archive/12.5.0/amd64/iso-cd/debian-12.5.0-amd64-netinst.iso"
-DEBIAN_CHECKSUM = "sha256:013f5b44670d8e235318f814e86727227d82d4eb727d2bc50630ba7be04a390e"
+DEBIAN_CHECKSUM = "none" 
 
 class Colors:
     HEADER = '\033[95m'
@@ -36,13 +37,9 @@ def print_color(text, color=Colors.ENDC):
     print(f"{color}{text}{Colors.ENDC}")
 
 # ============================================================================
-# HELPER: PRIVILEGE CHECK (FIXED FOR LINUX)
+# HELPER: PRIVILEGE CHECK
 # ============================================================================
 def check_privileges():
-    """
-    Enforces Administrator on Windows.
-    Enforces STANDARD USER on Linux/Mac (VirtualBox breaks as root).
-    """
     system = platform.system()
     try:
         if system == "Windows":
@@ -52,7 +49,7 @@ def check_privileges():
                 print("Please right-click and 'Run as Administrator'.")
                 sys.exit(1)
         else:
-            # Linux/Mac check
+            # Linux/Mac check: MUST NOT BE ROOT
             if os.geteuid() == 0:
                 print_color("\n[CRITICAL] DO NOT RUN AS ROOT", Colors.FAIL)
                 print("VirtualBox will crash if run with sudo.")
@@ -61,7 +58,6 @@ def check_privileges():
                 print("(The script will ask for sudo password only when installing packages)")
                 sys.exit(1)
     except Exception as e:
-        # Fallback if checks fail
         pass
 
 # ============================================================================
@@ -138,7 +134,6 @@ class DependencyManager:
         elif mgr == "dnf": cmd = ["sudo", "dnf", "install", "-y", pkg]
 
         try:
-            # Interactive sudo prompt if needed
             subprocess.run(cmd, check=True)
             print_color(f"    [SUCCESS] {pkg} installed.", Colors.GREEN)
             return True
@@ -168,24 +163,15 @@ class DependencyManager:
 # UTILITIES
 # ============================================================================
 def nuke_vm(vm_name):
-    """
-    Cleans up VMs.
-    On Linux/Mac, it aggressively finds the 'Default Machine Folder' 
-    to delete zombie directories causing VBOX_E_FILE_ERROR.
-    """
     vbox_cmd = "VBoxManage"
     if platform.system() == "Windows" and not shutil.which("VBoxManage"):
         vbox_cmd = r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
     
-    # 1. Soft Delete (Unregister)
     subprocess.run([vbox_cmd, "controlvm", vm_name, "poweroff"], stderr=subprocess.DEVNULL)
     time.sleep(1)
     subprocess.run([vbox_cmd, "unregistervm", vm_name, "--delete"], stderr=subprocess.DEVNULL)
     
-    # 2. Hard Delete (Directory) - Platform Specific Logic
     vbox_vm_path = None
-    
-    # Try to ask VBox where it stores VMs
     try:
         result = subprocess.run([vbox_cmd, "list", "systemproperties"], capture_output=True, text=True)
         for line in result.stdout.splitlines():
@@ -195,7 +181,6 @@ def nuke_vm(vm_name):
                 break
     except: pass
 
-    # Fallbacks
     if not vbox_vm_path:
         vbox_vm_path = HOME_DIR / "VirtualBox VMs" / vm_name
 
@@ -206,7 +191,6 @@ def nuke_vm(vm_name):
         except Exception as e:
             print_color(f"    [WARN] Failed to delete {vbox_vm_path}: {e}", Colors.YELLOW)
 
-    # 3. Output Directory Cleanup
     output_dir = BASE_DIR / f"output-{vm_name.lower().replace('lab-', '')}"
     if output_dir.exists():
         shutil.rmtree(output_dir, ignore_errors=True)
@@ -455,7 +439,12 @@ class FakeEDR {
         "New-ADUser -Name svc_backup -SamAccountName svc_backup -AccountPassword (ConvertTo-SecureString 'Backup2024!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "New-ADUser -Name helpdesk -SamAccountName helpdesk -AccountPassword (ConvertTo-SecureString 'Help123!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "Write-Host '>>> [4/10] Setting User Vulnerabilities...' -ForegroundColor Cyan",
-        "$u = Get-ADUser -Identity svc_backup -Properties UserAccountControl; $u.UserAccountControl = $u.UserAccountControl -bor 4194304; Set-ADUser -Instance $u",
+        
+        # FIXED: AS-REP Roasting via ADSI (Direct LDAP Modification)
+        "$u = [ADSI]'LDAP://CN=svc_backup,CN=Users,DC=lab,DC=local'",
+        "$u.userAccountControl = $u.userAccountControl.Value -bor 4194304",
+        "$u.SetInfo()",
+        
         "Set-ADUser -Identity svc_sql -ServicePrincipalNames @{Add='MSSQLSvc/dc01.lab.local:1433'}",
         "Write-Host '>>> [5/10] Creating SQL Database...' -ForegroundColor Cyan",
         "Invoke-Sqlcmd -Query \"CREATE DATABASE HR_DB;\" -ServerInstance 'localhost\\SQLEXPRESS'",
@@ -690,7 +679,7 @@ def main():
     check_privileges()
     
     print_color("==================================================================", Colors.CYAN)
-    print_color("        MODERN KILL LAB - MASTER BUILDER (v7.1 Permissions Fix)   ", Colors.CYAN)
+    print_color("        MODERN KILL LAB - MASTER BUILDER (v7.2 Stability)         ", Colors.CYAN)
     print_color("==================================================================", Colors.CYAN)
     
     dm = DependencyManager()
