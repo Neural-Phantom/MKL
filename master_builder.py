@@ -14,10 +14,9 @@ from pathlib import Path
 HOME_DIR = Path.home()
 BASE_DIR = HOME_DIR / "ModernHackingLab"
 
-# 1. ISO CONFIGURATION (With Checksums)
+# 1. ISO CONFIGURATION
 WS2022_TARGET_NAME = "ws2022.iso"
 WS2022_URL = "https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso"
-# Checksum is 'none' for Windows Eval as MS rotates binaries, but we suppress warning in Packer config
 WS2022_CHECKSUM = "none"
 
 DEBIAN_TARGET_NAME = "debian.iso"
@@ -36,7 +35,37 @@ def print_color(text, color=Colors.ENDC):
     print(f"{color}{text}{Colors.ENDC}")
 
 # ============================================================================
-# HELPER: DYNAMIC RAM CALCULATION
+# HELPER: PRIVILEGE CHECK
+# ============================================================================
+def check_privileges():
+    """
+    Enforces Administrator (Windows) or Root (Linux/Mac) privileges.
+    """
+    try:
+        is_admin = False
+        if platform.system() == "Windows":
+            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        else:
+            # Check for root on *nix
+            is_admin = os.geteuid() == 0
+
+        if not is_admin:
+            print_color("\n[CRITICAL ERROR] INSUFFICIENT PRIVILEGES", Colors.FAIL)
+            print_color("========================================", Colors.FAIL)
+            if platform.system() == "Windows":
+                print("You are running as a Standard User.")
+                print("Please right-click your terminal and select 'Run as Administrator'.")
+            else:
+                print("You are running as a Standard User.")
+                print("Please run this script with sudo:")
+                print(f"    sudo python3 {os.path.basename(__file__)}")
+            print_color("========================================", Colors.FAIL)
+            sys.exit(1)
+    except Exception as e:
+        print_color(f"[WARN] Could not verify privileges: {e}", Colors.YELLOW)
+
+# ============================================================================
+# HELPER: SYSTEM RESOURCES
 # ============================================================================
 def get_optimal_ram_mb():
     total_ram_mb = 4096
@@ -50,19 +79,22 @@ def get_optimal_ram_mb():
             memoryStatus.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
             kernel32.GlobalMemoryStatusEx(ctypes.byref(memoryStatus))
             total_ram_mb = int(memoryStatus.ullTotalPhys / (1024 * 1024))
-        elif platform.system() == "Linux":
-            with open('/proc/meminfo', 'r') as mem:
-                for line in mem:
-                    if "MemTotal" in line: total_ram_mb = int(line.split()[1]) // 1024; break
-        elif platform.system() == "Darwin":
-            total_ram_mb = 16384 
+        else:
+            if platform.system() == "Darwin":
+                cmd = subprocess.run(['sysctl', '-n', 'hw.memsize'], capture_output=True, text=True)
+                if cmd.returncode == 0:
+                    total_ram_mb = int(cmd.stdout.strip()) // (1024 * 1024)
+            elif platform.system() == "Linux":
+                with open('/proc/meminfo', 'r') as mem:
+                    for line in mem:
+                        if "MemTotal" in line: 
+                            total_ram_mb = int(line.split()[1]) // 1024
+                            break
     except: pass
+    
     target = int(total_ram_mb * 0.5)
     return max(4096, min(8192, target))
 
-# ============================================================================
-# HELPER: CONTENT ENCODING
-# ============================================================================
 def encode_file_content(content):
     return base64.b64encode(content.encode('utf-8')).decode('utf-8')
 
@@ -86,11 +118,9 @@ class DependencyManager:
         if self.os_type == "Darwin": return "brew"
         if self.os_type == "Linux":
             try:
-                with open("/etc/os-release") as f:
-                    data = f.read().lower()
-                    if "arch" in data: return "pacman"
-                    if "debian" in data or "ubuntu" in data: return "apt"
-                    if "fedora" in data: return "dnf"
+                if shutil.which("pacman"): return "pacman"
+                if shutil.which("apt-get"): return "apt"
+                if shutil.which("dnf"): return "dnf"
             except: pass
         return None
 
@@ -103,9 +133,9 @@ class DependencyManager:
         cmd = []
         if mgr == "winget": cmd = ["winget", "install", "-e", "--id", pkg]
         elif mgr == "brew": cmd = ["brew", "install", "--cask", pkg] if "virtualbox" in pkg else ["brew", "install", pkg]
-        elif mgr == "pacman": cmd = ["sudo", "pacman", "-S", "--noconfirm", pkg]
-        elif mgr == "apt": cmd = ["sudo", "apt-get", "install", "-y", pkg]
-        elif mgr == "dnf": cmd = ["sudo", "dnf", "install", "-y", pkg]
+        elif mgr == "pacman": cmd = ["pacman", "-S", "--noconfirm", pkg] # sudo not needed if running as root
+        elif mgr == "apt": cmd = ["apt-get", "install", "-y", pkg]
+        elif mgr == "dnf": cmd = ["dnf", "install", "-y", pkg]
 
         try:
             subprocess.run(cmd, check=True)
@@ -137,35 +167,37 @@ class DependencyManager:
 # UTILITIES
 # ============================================================================
 def nuke_vm(vm_name):
-    """
-    Aggressively deletes VMs to prevent 'Machine settings file already exists' errors.
-    """
-    vbox = "VBoxManage"
+    vbox_cmd = "VBoxManage"
     if platform.system() == "Windows" and not shutil.which("VBoxManage"):
-        vbox = r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
+        vbox_cmd = r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
     
-    # 1. Try Soft Delete via VBoxManage
-    subprocess.run([vbox, "controlvm", vm_name, "poweroff"], stderr=subprocess.DEVNULL)
+    subprocess.run([vbox_cmd, "controlvm", vm_name, "poweroff"], stderr=subprocess.DEVNULL)
     time.sleep(1)
-    subprocess.run([vbox, "unregistervm", vm_name, "--delete"], stderr=subprocess.DEVNULL)
+    subprocess.run([vbox_cmd, "unregistervm", vm_name, "--delete"], stderr=subprocess.DEVNULL)
     
-    # 2. Hard Delete: Default VirtualBox Folder
-    # Linux/Mac: ~/VirtualBox VMs/Lab-DC01
-    # Windows: C:\Users\User\VirtualBox VMs\Lab-DC01
-    vbox_default_dir = Path.home() / "VirtualBox VMs" / vm_name
-    if vbox_default_dir.exists():
-        print_color(f"    [CLEAN] Removing leftover VM dir: {vbox_default_dir}", Colors.FAIL)
-        try:
-            shutil.rmtree(vbox_default_dir, ignore_errors=True)
-        except Exception as e:
-            print_color(f"    [WARN] Could not delete {vbox_default_dir}: {e}", Colors.YELLOW)
+    vbox_vm_path = None
+    try:
+        result = subprocess.run([vbox_cmd, "list", "systemproperties"], capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if "Default machine folder:" in line:
+                path_str = line.split(":", 1)[1].strip()
+                vbox_vm_path = Path(path_str) / vm_name
+                break
+    except: pass
 
-    # 3. Hard Delete: Packer Output Directory
-    # Check current directory
-    local_output = BASE_DIR / f"output-{vm_name.lower().replace('lab-', '')}"
-    if local_output.exists():
-        print_color(f"    [CLEAN] Removing Packer output dir: {local_output}", Colors.FAIL)
-        shutil.rmtree(local_output, ignore_errors=True)
+    if not vbox_vm_path:
+        vbox_vm_path = Path.home() / "VirtualBox VMs" / vm_name
+
+    if vbox_vm_path and vbox_vm_path.exists():
+        print_color(f"    [CLEAN] Removing zombie VM dir: {vbox_vm_path}", Colors.FAIL)
+        try:
+            shutil.rmtree(vbox_vm_path, ignore_errors=True)
+        except Exception as e:
+            print_color(f"    [WARN] Failed to delete {vbox_vm_path}: {e}", Colors.YELLOW)
+
+    output_dir = BASE_DIR / f"output-{vm_name.lower().replace('lab-', '')}"
+    if output_dir.exists():
+        shutil.rmtree(output_dir, ignore_errors=True)
 
 def download_file(url, dest_path):
     print_color(f"    [DOWNLOADING] Target: {dest_path.name}...", Colors.CYAN)
@@ -189,16 +221,15 @@ def download_file(url, dest_path):
         return False
 
 # ============================================================================
-# FILE GENERATION (VERBOSE)
+# FILE GENERATION
 # ============================================================================
 def generate_files():
     print_color("\n>>> GENERATING CONFIGURATION FILES...", Colors.YELLOW)
     
-    # RAM Calculation
     ram_mb = get_optimal_ram_mb()
     print_color(f"    [CONFIG] Optimized RAM Allocation: {ram_mb} MB", Colors.GREEN)
 
-    # 3A. PRESEED.CFG
+    # 3A. PRESEED
     with open(BASE_DIR / "http" / "preseed.cfg", "w") as f:
         f.write("""d-i debian-installer/locale string en_US
 d-i keyboard-configuration/xkb-keymap select us
@@ -412,7 +443,6 @@ class FakeEDR {
         "New-ADUser -Name svc_backup -SamAccountName svc_backup -AccountPassword (ConvertTo-SecureString 'Backup2024!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "New-ADUser -Name helpdesk -SamAccountName helpdesk -AccountPassword (ConvertTo-SecureString 'Help123!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "Write-Host '>>> [4/10] Setting User Vulnerabilities...' -ForegroundColor Cyan",
-        # FIX: The following line replaces the broken "Set-ADUser -DoesNotRequirePreAuth" command
         "$u = Get-ADUser -Identity svc_backup -Properties UserAccountControl; $u.UserAccountControl = $u.UserAccountControl -bor 4194304; Set-ADUser -Instance $u",
         "Set-ADUser -Identity svc_sql -ServicePrincipalNames @{Add='MSSQLSvc/dc01.lab.local:1433'}",
         "Write-Host '>>> [5/10] Creating SQL Database...' -ForegroundColor Cyan",
@@ -544,6 +574,7 @@ build {{
     iso_path_deb = (BASE_DIR / DEBIAN_TARGET_NAME).as_uri()
 
     web_base = [
+        "export DEBIAN_FRONTEND=noninteractive",
         "sudo apt-get update",
         "sudo apt-get install -y curl gnupg net-tools python3-flask python3-pip gcc make libcap2-bin vim auditd audispd-plugins samba",
         "curl -fsSL https://get.docker.com -o get-docker.sh",
@@ -644,11 +675,12 @@ build {{
 # MAIN
 # ============================================================================
 def main():
+    check_privileges()
+    
     print_color("==================================================================", Colors.CYAN)
-    print_color("        MODERN KILL LAB - MASTER BUILDER (v5.4 Linux Fix)         ", Colors.CYAN)
+    print_color("        MODERN KILL LAB - MASTER BUILDER (v7.0 Admin Enforced)    ", Colors.CYAN)
     print_color("==================================================================", Colors.CYAN)
     
-    # 1. DEPENDENCY CHECK
     dm = DependencyManager()
     print(f"Platform: {dm.os_type}")
     if not dm.check_packer(): return
@@ -661,7 +693,6 @@ def main():
     (BASE_DIR / "http").mkdir(exist_ok=True)
     os.chdir(BASE_DIR)
 
-    # 2. ISO CHECKS
     ws2022_path = BASE_DIR / WS2022_TARGET_NAME
     if not ws2022_path.exists():
         print_color(f"\n[-] '{WS2022_TARGET_NAME}' is missing.", Colors.YELLOW)
@@ -674,11 +705,9 @@ def main():
         download_file(DEBIAN_URL, debian_path)
     else: print_color(f"    [CHECK] {DEBIAN_TARGET_NAME} found.", Colors.GREEN)
 
-    # 3. CLEANUP
     nuke_vm("Lab-DC01")
     nuke_vm("Lab-Web01")
     
-    # 4. BUILD
     generate_files()
     print_color("\n>>> STARTING PACKER BUILDS...", Colors.YELLOW)
     subprocess.run(["packer", "init", "."], shell=(dm.os_type=="Windows"))
