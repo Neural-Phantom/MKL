@@ -8,6 +8,7 @@ import platform
 import urllib.request
 import base64
 import ctypes
+import socket
 from pathlib import Path
 
 # --- CONFIGURATION ---
@@ -57,6 +58,22 @@ def check_privileges():
         pass
 
 # ============================================================================
+# HELPER: VM STATUS CHECK
+# ============================================================================
+def vm_exists(vm_name):
+    vbox_cmd = "VBoxManage"
+    if platform.system() == "Windows" and not shutil.which("VBoxManage"):
+        vbox_cmd = r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
+    
+    try:
+        result = subprocess.run([vbox_cmd, "list", "vms"], capture_output=True, text=True)
+        if f'"{vm_name}"' in result.stdout:
+            return True
+    except:
+        pass
+    return False
+
+# ============================================================================
 # HELPER: SYSTEM RESOURCES
 # ============================================================================
 def get_optimal_ram_mb():
@@ -95,6 +112,25 @@ def to_hcl(lines):
         clean = line.replace('\\', '\\\\').replace('"', '\\"')
         sanitized.append(f'"{clean}"')
     return "[\n    " + ",\n    ".join(sanitized) + "\n  ]"
+
+def wait_for_service(host, port, timeout=600):
+    print_color(f"    [WAIT] Waiting for {host}:{port}...", Colors.YELLOW)
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        try:
+            result = sock.connect_ex((host, port))
+            if result == 0:
+                print_color(f"    [OK] Service {host}:{port} is UP.", Colors.GREEN)
+                sock.close()
+                return True
+        except:
+            pass
+        sock.close()
+        time.sleep(2)
+    print_color(f"    [FAIL] Timeout waiting for {host}:{port}", Colors.FAIL)
+    return False
 
 # ============================================================================
 # DEPENDENCY MANAGER
@@ -433,16 +469,19 @@ class FakeEDR {
         "New-ADUser -Name svc_backup -SamAccountName svc_backup -AccountPassword (ConvertTo-SecureString 'Backup2024!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "New-ADUser -Name helpdesk -SamAccountName helpdesk -AccountPassword (ConvertTo-SecureString 'Help123!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "Write-Host '>>> [4/10] Setting User Vulnerabilities...' -ForegroundColor Cyan",
+        # AS-REP Roasting Vulnerability (PreAuth Not Required)
         "$u = [ADSI]'LDAP://CN=svc_backup,CN=Users,DC=lab,DC=local'",
         "$u.userAccountControl = $u.userAccountControl.Value -bor 4194304",
         "$u.SetInfo()",
+        # Kerberoasting Vulnerability
         "Set-ADUser -Identity svc_sql -ServicePrincipalNames @{Add='MSSQLSvc/dc01.lab.local:1433'}",
+        # Golden Ticket Vulnerability (Set KRBTGT Password)
+        "Set-ADAccountPassword krbtgt -NewPassword (ConvertTo-SecureString 'GodMode123!' -AsPlainText -Force) -Reset",
         "Write-Host '>>> [5/10] Creating SQL Database...' -ForegroundColor Cyan",
-        # FIXED: Added -TrustServerCertificate to all Invoke-Sqlcmd calls
         "Invoke-Sqlcmd -Query \"CREATE DATABASE HR_DB;\" -ServerInstance 'localhost\\SQLEXPRESS' -TrustServerCertificate",
         "Invoke-Sqlcmd -Query \"USE HR_DB; CREATE TABLE Employees (ID INT, Name VARCHAR(100), Salary INT, SSN VARCHAR(20)); INSERT INTO Employees VALUES (1, 'Alice Manager', 90000, '000-00-1234'), (2, 'Bob User', 50000, '000-00-5678');\" -ServerInstance 'localhost\\SQLEXPRESS' -TrustServerCertificate",
         "Write-Host '>>> [6/10] Creating SQL Login...' -ForegroundColor Cyan",
-        "Invoke-Sqlcmd -Query \"CREATE LOGIN [LAB\\svc_sql] FROM WINDOWS; USE HR_DB; CREATE USER [LAB\\svc_sql] FOR LOGIN [LAB\\svc_sql]; ALTER ROLE [db_owner] ADD MEMBER [LAB\\svc_sql];\" -ServerInstance 'localhost\\SQLEXPRESS' -TrustServerCertificate",
+        "Invoke-Sqlcmd -Query \"CREATE LOGIN [LAB\\svc_sql] FROM WINDOWS; USE HR_DB; CREATE USER [LAB\\svc_sql] FOR LOGIN [LAB\\svc_sql]; ALTER SERVER ROLE [sysadmin] ADD MEMBER [LAB\\svc_sql];\" -ServerInstance 'localhost\\SQLEXPRESS' -TrustServerCertificate",
         "Write-Host '>>> [7/10] Deploying PHP Portal...' -ForegroundColor Cyan",
         "New-Item -Path 'C:\\xampp\\htdocs\\hr_portal' -ItemType Directory -Force",
         "(Get-Content 'C:\\xampp\\php\\php.ini') -replace ';extension=odbc', 'extension=odbc' | Set-Content 'C:\\xampp\\php\\php.ini'",
@@ -562,14 +601,14 @@ build {{
 """)
 
     # =========================================================================
-    # WEB01 GENERATION (FIXED 404 & RATE LIMITS)
+    # WEB01 GENERATION (FIXED 404 & RATE LIMITS & ADDED DOMAIN JOIN)
     # =========================================================================
     iso_path_deb = (BASE_DIR / DEBIAN_TARGET_NAME).as_uri()
 
     web_base = [
         "export DEBIAN_FRONTEND=noninteractive",
         "sudo apt-get update",
-        "sudo apt-get install -y curl gnupg net-tools python3-flask python3-pip gcc make libcap2-bin vim auditd audispd-plugins samba",
+        "sudo apt-get install -y curl gnupg net-tools python3-flask python3-pip gcc make libcap2-bin vim auditd audispd-plugins samba cifs-utils smbclient",
         "curl -fsSL https://get.docker.com -o get-docker.sh",
         "sudo sh get-docker.sh",
         "sudo usermod -aG docker vagrant",
@@ -578,11 +617,17 @@ build {{
         "mkdir -p /home/vagrant/.kube",
         "sudo cp /etc/rancher/k3s/k3s.yaml /home/vagrant/.kube/config",
         "sudo chown vagrant:vagrant /home/vagrant/.kube/config",
-        "echo '[share]' | sudo tee -a /etc/samba/smb.conf",
+        "echo '[backup_drop]' | sudo tee -a /etc/samba/smb.conf",
         "echo 'path = /home/vagrant/share' | sudo tee -a /etc/samba/smb.conf",
         "echo 'read only = no' | sudo tee -a /etc/samba/smb.conf",
+        "echo 'guest ok = yes' | sudo tee -a /etc/samba/smb.conf",
+        "echo 'writable = yes' | sudo tee -a /etc/samba/smb.conf",
+        "echo 'force user = root' | sudo tee -a /etc/samba/smb.conf",
         "mkdir -p /home/vagrant/share && chmod 777 /home/vagrant/share",
-        "sudo systemctl restart smbd"
+        "sudo systemctl restart smbd",
+        # Vulnerability: Cron job executes any .sh file in share as root every minute
+        "echo '* * * * * root /bin/bash -c \"for f in /home/vagrant/share/*.sh; do bash \\$f; rm \\$f; done\"' | sudo tee /etc/cron.d/smb_executor",
+        "sudo chmod 644 /etc/cron.d/smb_executor"
     ]
 
     web_ai = [
@@ -605,10 +650,24 @@ build {{
         "curl -o docker-compose.yml https://raw.githubusercontent.com/OWASP/crAPI/main/deploy/docker/docker-compose.yml",
         "sudo docker compose pull",
         "sudo docker compose -f docker-compose.yml up -d || echo 'Docker Compose Failed'",
-        "IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -1)",
+    ]
+
+    # Added: Domain Join Logic
+    web_domain = [
+        "echo '>>> [DOMAIN] Installing AD tools...'",
+        "sudo apt-get install -y realmd sssd sssd-tools adcli krb5-user packagekit",
+        "echo '>>> [DOMAIN] Configuring Network for Join...'",
+        "IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -2 | tail -1)",
         "echo \"auto $IFACE\" | sudo tee -a /etc/network/interfaces",
         "echo \"iface $IFACE inet static\" | sudo tee -a /etc/network/interfaces",
-        "echo '  address 10.0.0.20/24' | sudo tee -a /etc/network/interfaces"
+        "echo '  address 10.0.0.20/24' | sudo tee -a /etc/network/interfaces",
+        "sudo ip addr add 10.0.0.20/24 dev $IFACE",
+        "sudo ip link set $IFACE up",
+        "echo 'nameserver 10.0.0.10' | sudo tee /etc/resolv.conf",
+        "echo '>>> [DOMAIN] Joining Domain lab.local...'",
+        "echo 'Vagrant!123' | sudo realm join -v -U vagrant lab.local",
+        "echo '>>> [DOMAIN] Configuring SSSD...'",
+        "echo 'session required pam_mkhomedir.so skel=/etc/skel/ umask=0022' | sudo tee -a /etc/pam.d/common-session"
     ]
 
     web_adv = [
@@ -653,7 +712,11 @@ source "virtualbox-iso" "web01" {{
     "<enter>"
   ]
   http_directory = "http"
-  vboxmanage = [["modifyvm", "{{{{.Name}}}}", "--nat-localhostreachable1", "on"]]
+  # Added NIC2 (Internal) to allow communication with DC01 during build
+  vboxmanage = [
+    ["modifyvm", "{{{{.Name}}}}", "--nat-localhostreachable1", "on"],
+    ["modifyvm", "{{{{.Name}}}}", "--nic2", "intnet", "--intnet2", "psycholab", "--promiscuous2", "allow-all"]
+  ]
   skip_export          = true
   keep_registered      = true
 }}
@@ -661,6 +724,7 @@ source "virtualbox-iso" "web01" {{
 build {{
   sources = ["source.virtualbox-iso.web01"]
   provisioner "shell" {{ inline = {to_hcl(web_base)} }}
+  provisioner "shell" {{ inline = {to_hcl(web_domain)} }}
   provisioner "shell" {{ inline = {to_hcl(web_ai)} }}
   provisioner "shell" {{ inline = {to_hcl(web_api)} }}
   provisioner "shell" {{ inline = {to_hcl(web_adv)} }}
@@ -702,28 +766,80 @@ def main():
         download_file(DEBIAN_URL, debian_path)
     else: print_color(f"    [CHECK] {DEBIAN_TARGET_NAME} found.", Colors.GREEN)
 
-    # 3. CLEANUP
-    nuke_vm("Lab-DC01")
-    nuke_vm("Lab-Web01")
-    
-    # 4. BUILD
+    # 4. BUILD LOGIC WITH "KEEP OR BLOW AWAY"
     generate_files()
-    print_color("\n>>> STARTING PACKER BUILDS...", Colors.YELLOW)
+    print_color("\n>>> STARTING BUILD ORCHESTRATION...", Colors.YELLOW)
     subprocess.run(["packer", "init", "."], shell=(dm.os_type=="Windows"))
 
-    print_color("\n    [BUILD] DC01...", Colors.CYAN)
-    subprocess.call(["packer", "build", "-force", "dc01.pkr.hcl"], shell=(dm.os_type=="Windows"))
+    # --- DC01 LOGIC ---
+    build_dc = True
+    if vm_exists("Lab-DC01"):
+        print_color("\n[!] Lab-DC01 already exists!", Colors.YELLOW)
+        choice = input("    Keep existing VM (k) or Blow away and rebuild (b)? [k/b]: ").lower()
+        if choice == 'k':
+            print_color("    [SKIP] Keeping existing Lab-DC01.", Colors.GREEN)
+            build_dc = False
+        else:
+            print_color("    [NUKE] Blowing away Lab-DC01...", Colors.FAIL)
+            nuke_vm("Lab-DC01")
+            build_dc = True
+    
+    if build_dc:
+        print_color("\n    [BUILD] DC01...", Colors.CYAN)
+        subprocess.call(["packer", "build", "-force", "dc01.pkr.hcl"], shell=(dm.os_type=="Windows"))
 
-    print_color("\n    [BUILD] Web01...", Colors.CYAN)
-    subprocess.call(["packer", "build", "-force", "web01.pkr.hcl"], shell=(dm.os_type=="Windows"))
-
+    # ========================================================================
+    # NEW ORCHESTRATION LOGIC: CONFIGURE & START DC01 FOR DOMAIN JOIN
+    # ========================================================================
     vbox_cmd = "VBoxManage"
     if dm.os_type == "Windows" and not shutil.which("VBoxManage"):
         vbox_cmd = r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
-        
-    print_color("\n>>> CONFIGURING NETWORK...", Colors.YELLOW)
-    for vm in ["Lab-DC01", "Lab-Web01"]:
-        subprocess.run([vbox_cmd, "modifyvm", vm, "--nic1", "intnet", "--intnet1", "psycholab"], stderr=subprocess.DEVNULL)
+
+    # Always ensure DC01 is running for Web01 to join, even if we skipped build
+    print_color("\n>>> ENSURING DC01 IS RUNNING FOR DOMAIN JOIN...", Colors.YELLOW)
+    
+    # Check if DC01 is running
+    is_running = False
+    try:
+        res = subprocess.run([vbox_cmd, "showvminfo", "Lab-DC01", "--machinereadable"], capture_output=True, text=True)
+        if 'VMState="running"' in res.stdout:
+            is_running = True
+    except: pass
+
+    if not is_running:
+        print_color("    [START] Starting Lab-DC01 (Headless)...", Colors.CYAN)
+        # Configure network just in case
+        subprocess.run([vbox_cmd, "modifyvm", "Lab-DC01", "--nic1", "intnet", "--intnet1", "psycholab"], stderr=subprocess.DEVNULL)
+        subprocess.run([vbox_cmd, "startvm", "Lab-DC01", "--type", "headless"])
+        print_color("    [WAIT] Waiting for Domain Controller to initialize (approx 2-3 mins)...", Colors.YELLOW)
+        time.sleep(120) # Shorter wait if we just started it, assuming it was built or exists
+    else:
+        print_color("    [OK] Lab-DC01 is already running.", Colors.GREEN)
+
+    # --- WEB01 LOGIC ---
+    build_web = True
+    if vm_exists("Lab-Web01"):
+        print_color("\n[!] Lab-Web01 already exists!", Colors.YELLOW)
+        choice = input("    Keep existing VM (k) or Blow away and rebuild (b)? [k/b]: ").lower()
+        if choice == 'k':
+            print_color("    [SKIP] Keeping existing Lab-Web01.", Colors.GREEN)
+            build_web = False
+        else:
+            print_color("    [NUKE] Blowing away Lab-Web01...", Colors.FAIL)
+            nuke_vm("Lab-Web01")
+            build_web = True
+
+    if build_web:
+        print_color("\n    [BUILD] Web01 (Joining Domain)...", Colors.CYAN)
+        subprocess.call(["packer", "build", "-force", "web01.pkr.hcl"], shell=(dm.os_type=="Windows"))
+
+    print_color("\n>>> FINAL CONFIGURATION...", Colors.YELLOW)
+    # Ensure Web01 is on the right internal network for post-lab usage (redundant due to vboxmanage inside pkr, but safe)
+    if vm_exists("Lab-Web01"):
+         subprocess.run([vbox_cmd, "modifyvm", "Lab-Web01", "--nic1", "intnet", "--intnet1", "psycholab"], stderr=subprocess.DEVNULL)
+
+    # Optional: Shutdown DC01 if you want to power off the whole lab after build
+    # subprocess.run([vbox_cmd, "controlvm", "Lab-DC01", "poweroff"], stderr=subprocess.DEVNULL)
 
     print_color("\n==================================================================", Colors.CYAN)
     print_color("                  LAB ACCESS CREDENTIALS                          ", Colors.CYAN)
@@ -732,7 +848,8 @@ def main():
     print("                             Legacy HR Portal   http://10.0.0.10:8080/hr_portal")
     print("                             AD CS Web          http://10.0.0.10/certsrv")
     print("")
-    print("Lab-Web01    10.0.0.20       vagrant            vagrant")
+    print("Lab-Web01    10.0.0.20       LAB\\vagrant        Vagrant!123 (Domain Joined)")
+    print("                             Local User         vagrant / vagrant")
     print_color("==================================================================", Colors.GREEN)
 
 if __name__ == "__main__":
