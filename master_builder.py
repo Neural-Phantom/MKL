@@ -664,11 +664,10 @@ build {{
     ]
 
     # Added: Domain Join Logic
-    # FIX: Added export DEBIAN_FRONTEND=noninteractive to prevent krb5-user hang
+    # FIX: Added DEBIAN_FRONTEND=noninteractive inline to sudo to prevent krb5-user hang
     web_domain = [
-        "export DEBIAN_FRONTEND=noninteractive",
         "echo '>>> [DOMAIN] Installing AD tools...'",
-        "sudo apt-get install -y realmd sssd sssd-tools adcli krb5-user packagekit",
+        "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y realmd sssd sssd-tools adcli krb5-user packagekit",
         "echo '>>> [DOMAIN] Configuring Network for Join...'",
         "IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -2 | tail -1)",
         "echo \"auto $IFACE\" | sudo tee -a /etc/network/interfaces",
