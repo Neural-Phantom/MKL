@@ -204,13 +204,10 @@ def nuke_vm(vm_name):
     time.sleep(1)
     subprocess.run([vbox_cmd, "unregistervm", vm_name, "--delete"], stderr=subprocess.DEVNULL)
     
-    # 2. NEW: Aggressively remove zombie media (The Fix for NS_ERROR_INVALID_ARG)
-    # We construct the likely path where Packer left the stuck disk
+    # 2. Aggressively remove zombie media
     output_dir_name = f"output-{vm_name.lower().replace('lab-', '')}"
     potential_vdi = BASE_DIR / output_dir_name / f"{vm_name}.vdi"
     
-    # We attempt to close the medium by path. If it exists in registry, this kills it.
-    # If it doesn't exist, it errors silently, which is fine.
     print_color(f"    [CLEAN] purging zombie media entries...", Colors.CYAN)
     subprocess.run([vbox_cmd, "closemedium", "disk", str(potential_vdi), "--delete"], stderr=subprocess.DEVNULL)
     
@@ -269,10 +266,11 @@ def generate_files():
     print_color(f"    [CONFIG] Optimized RAM Allocation: {ram_mb} MB", Colors.GREEN)
 
     # 3A. PRESEED
+    # FIX: Explicitly select enp0s3 to prevent interactive prompt in dual-NIC setup
     with open(BASE_DIR / "http" / "preseed.cfg", "w") as f:
         f.write("""d-i debian-installer/locale string en_US
 d-i keyboard-configuration/xkb-keymap select us
-d-i netcfg/choose_interface select auto
+d-i netcfg/choose_interface select enp0s3
 d-i netcfg/get_hostname string Lab-Web01
 d-i netcfg/get_domain string local
 d-i mirror/country string manual
@@ -700,6 +698,7 @@ build {{
         "echo 'AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE' >> /home/vagrant/exfil_lab/.env"
     ]
 
+    # FIX APPLIED HERE: Added interface=enp0s3 to boot_command
     with open(BASE_DIR / "web01.pkr.hcl", "w") as f:
         f.write(f"""
 source "virtualbox-iso" "web01" {{
@@ -721,14 +720,14 @@ source "virtualbox-iso" "web01" {{
   boot_wait            = "5s"
   boot_command = [
     "<esc><wait>",
-    "auto url=http://{{{{ .HTTPIP }}}}:{{{{ .HTTPPort }}}}/preseed.cfg ",
+    "auto url=http://{{{{ .HTTPIP }}}}:{{{{ .HTTPPort }}}}/preseed.cfg interface=enp0s3 ",
     "<enter>"
   ]
   http_directory = "http"
   # Added NIC2 (Internal) to allow communication with DC01 during build
   vboxmanage = [
     ["modifyvm", "{{{{.Name}}}}", "--nat-localhostreachable1", "on"],
-    ["modifyvm", "{{{{.Name}}}}", "--nic2", "intnet", "--intnet2", "psycholab", "--promiscuous2", "allow-all"]
+    ["modifyvm", "{{{{.Name}}}}", "--nic2", "intnet", "--intnet2", "psycholab", "--nic-promisc2", "allow-all"]
   ]
   skip_export          = true
   keep_registered      = true
