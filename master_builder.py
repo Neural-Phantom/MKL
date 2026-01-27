@@ -198,10 +198,23 @@ def nuke_vm(vm_name):
     if platform.system() == "Windows" and not shutil.which("VBoxManage"):
         vbox_cmd = r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
     
+    # 1. Power off and delete VM
+    print_color(f"    [CLEAN] Unregistering VM: {vm_name}...", Colors.CYAN)
     subprocess.run([vbox_cmd, "controlvm", vm_name, "poweroff"], stderr=subprocess.DEVNULL)
     time.sleep(1)
     subprocess.run([vbox_cmd, "unregistervm", vm_name, "--delete"], stderr=subprocess.DEVNULL)
     
+    # 2. NEW: Aggressively remove zombie media (The Fix for NS_ERROR_INVALID_ARG)
+    # We construct the likely path where Packer left the stuck disk
+    output_dir_name = f"output-{vm_name.lower().replace('lab-', '')}"
+    potential_vdi = BASE_DIR / output_dir_name / f"{vm_name}.vdi"
+    
+    # We attempt to close the medium by path. If it exists in registry, this kills it.
+    # If it doesn't exist, it errors silently, which is fine.
+    print_color(f"    [CLEAN] purging zombie media entries...", Colors.CYAN)
+    subprocess.run([vbox_cmd, "closemedium", "disk", str(potential_vdi), "--delete"], stderr=subprocess.DEVNULL)
+    
+    # 3. Clean up VM folders
     vbox_vm_path = None
     try:
         result = subprocess.run([vbox_cmd, "list", "systemproperties"], capture_output=True, text=True)
@@ -216,13 +229,13 @@ def nuke_vm(vm_name):
         vbox_vm_path = HOME_DIR / "VirtualBox VMs" / vm_name
 
     if vbox_vm_path and vbox_vm_path.exists():
-        print_color(f"    [CLEAN] Removing zombie VM dir: {vbox_vm_path}", Colors.FAIL)
         try:
             shutil.rmtree(vbox_vm_path, ignore_errors=True)
         except Exception as e:
             print_color(f"    [WARN] Failed to delete {vbox_vm_path}: {e}", Colors.YELLOW)
 
-    output_dir = BASE_DIR / f"output-{vm_name.lower().replace('lab-', '')}"
+    # 4. Clean up Packer output directory
+    output_dir = BASE_DIR / output_dir_name
     if output_dir.exists():
         shutil.rmtree(output_dir, ignore_errors=True)
 
