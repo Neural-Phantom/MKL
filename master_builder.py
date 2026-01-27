@@ -113,25 +113,6 @@ def to_hcl(lines):
         sanitized.append(f'"{clean}"')
     return "[\n    " + ",\n    ".join(sanitized) + "\n  ]"
 
-def wait_for_service(host, port, timeout=600):
-    print_color(f"    [WAIT] Waiting for {host}:{port}...", Colors.YELLOW)
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(2)
-        try:
-            result = sock.connect_ex((host, port))
-            if result == 0:
-                print_color(f"    [OK] Service {host}:{port} is UP.", Colors.GREEN)
-                sock.close()
-                return True
-        except:
-            pass
-        sock.close()
-        time.sleep(2)
-    print_color(f"    [FAIL] Timeout waiting for {host}:{port}", Colors.FAIL)
-    return False
-
 # ============================================================================
 # DEPENDENCY MANAGER
 # ============================================================================
@@ -266,7 +247,6 @@ def generate_files():
     print_color(f"    [CONFIG] Optimized RAM Allocation: {ram_mb} MB", Colors.GREEN)
 
     # 3A. PRESEED
-    # FIX: Explicitly select enp0s3 to prevent interactive prompt in dual-NIC setup
     with open(BASE_DIR / "http" / "preseed.cfg", "w") as f:
         f.write("""d-i debian-installer/locale string en_US
 d-i keyboard-configuration/xkb-keymap select us
@@ -419,6 +399,8 @@ class FakeEDR {
         "Write-Host '>>> [1/5] Configuring Execution Policy...' -ForegroundColor Cyan",
         "Set-ExecutionPolicy Bypass -Scope Process -Force",
         "Set-MpPreference -DisableRealtimeMonitoring $true",
+        # FIX: Disable firewall to ensure Web01 can connect to DC services
+        "Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False",
         "Rename-Computer -NewName 'DC01' -Force",
         "Write-Host '>>> [2/5] Configuring Security Protocols...' -ForegroundColor Cyan",
         "[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072",
@@ -548,22 +530,12 @@ class FakeEDR {
     ]
 
     dc_ip = [
-        "Unregister-ScheduledTask -TaskName 'SetStaticIP' -Confirm:$false -ErrorAction SilentlyContinue",
-        "$lines = @(",
-        "  '$ip = ''10.0.0.10''',",
-        "  '$prefix = 24',",
-        "  '$gw = ''''',",
-        "  '$dns = ''127.0.0.1''',",
-        "  '$adapter = Get-NetAdapter | Where-Object Status -eq ''Up'' | Select-Object -First 1',",
-        "  'New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $ip -PrefixLength $prefix -DefaultGateway $gw -ErrorAction SilentlyContinue',",
-        "  'Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses $dns',",
-        "  'Unregister-ScheduledTask -TaskName ''SetStaticIP'' -Confirm:$false',",
-        "  'Remove-Item -Path ''C:\\Set-StaticIP.ps1'' -Force'",
-        ")",
-        "Set-Content -Path 'C:\\Set-StaticIP.ps1' -Value $lines",
-        "$action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument '-ExecutionPolicy Bypass -File C:\\Set-StaticIP.ps1'",
-        "$trigger = New-ScheduledTaskTrigger -AtStartup",
-        "Register-ScheduledTask -Action $action -Trigger $trigger -TaskName 'SetStaticIP' -User 'SYSTEM' -RunLevel Highest"
+        "Write-Host '>>> Configuring Static IP on Internal Network...' -ForegroundColor Cyan",
+        "$intnetAdapter = Get-NetAdapter | Where-Object { $_.Name -like '*2*' -or $_.InterfaceDescription -like '*#2*' } | Select-Object -First 1",
+        "if (-not $intnetAdapter) { $intnetAdapter = Get-NetAdapter | Select-Object -Last 1 }",
+        "New-NetIPAddress -InterfaceIndex $intnetAdapter.ifIndex -IPAddress 10.0.0.10 -PrefixLength 24 -ErrorAction SilentlyContinue",
+        "Set-DnsClientServerAddress -InterfaceIndex $intnetAdapter.ifIndex -ServerAddresses 127.0.0.1",
+        "Write-Host '>>> Internal Network IP configured: 10.0.0.10' -ForegroundColor Green"
     ]
 
     iso_path_win = (BASE_DIR / WS2022_TARGET_NAME).as_uri()
@@ -590,6 +562,9 @@ source "virtualbox-iso" "dc01" {{
   guest_os_type        = "Windows2019_64"
   iso_url              = "{iso_path_win}"
   guest_additions_mode = "disable"
+  vboxmanage = [
+    ["modifyvm", "{{{{.Name}}}}", "--nic2", "intnet", "--intnet2", "psycholab", "--nic-promisc2", "allow-all"]
+  ]
   skip_export          = true
   keep_registered      = true
 }}
@@ -675,6 +650,14 @@ build {{
         "echo '  address 10.0.0.20/24' | sudo tee -a /etc/network/interfaces",
         "sudo ip addr add 10.0.0.20/24 dev $IFACE",
         "sudo ip link set $IFACE up",
+        # FIX: Added Host File Entry
+        "echo '10.0.0.10 dc01.lab.local lab.local' | sudo tee -a /etc/hosts",
+        # FIX: Explicit Route
+        "sudo ip route add 10.0.0.0/24 dev $IFACE || echo 'Route exists'",
+        # FIX: Added explicit retry loop to wait for DC connectivity
+        "echo '>>> [DOMAIN] Waiting for DC connectivity (up to 2 mins)...'",
+        "for i in $(seq 1 24); do ping -c 1 -W 1 10.0.0.10 >/dev/null 2>&1 && break; sleep 5; done",
+        "ping -c 2 10.0.0.10 || { echo 'CRITICAL: DC Unreachable'; exit 1; }",
         "echo 'nameserver 10.0.0.10' | sudo tee /etc/resolv.conf",
         "echo '>>> [DOMAIN] Joining Domain lab.local...'",
         "echo 'Vagrant!123' | sudo realm join -v -U vagrant lab.local",
@@ -821,11 +804,9 @@ def main():
 
     if not is_running:
         print_color("    [START] Starting Lab-DC01 (Headless)...", Colors.CYAN)
-        # Configure network just in case
-        subprocess.run([vbox_cmd, "modifyvm", "Lab-DC01", "--nic1", "intnet", "--intnet1", "psycholab"], stderr=subprocess.DEVNULL)
         subprocess.run([vbox_cmd, "startvm", "Lab-DC01", "--type", "headless"])
-        print_color("    [WAIT] Waiting for Domain Controller to initialize (approx 2-3 mins)...", Colors.YELLOW)
-        time.sleep(120) # Shorter wait if we just started it, assuming it was built or exists
+        print_color("    [WAIT] Waiting for Domain Controller to initialize (approx 3 mins)...", Colors.YELLOW)
+        time.sleep(180)
     else:
         print_color("    [OK] Lab-DC01 is already running.", Colors.GREEN)
 
