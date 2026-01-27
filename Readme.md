@@ -39,17 +39,6 @@
    >> AMSI: [BYPASSED]
    >> EDR:  [BLINDED]
 
-# ☠️ MODERN KILL LAB
-
-```      
-                         ╔═══════════════════════════════════╗                            
-                         ║     v8.0 GOLD MASTER EDITION      ║                            
-                           WEAPONIZED INFRASTRUCTURE-AS-CODE                              
-                         ╚═══════════════════════════════════╝                            
-                                                                                           
-```
-
----
 
 ## 💀 WHAT IS THIS?
 
