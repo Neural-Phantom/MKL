@@ -1,10 +1,5 @@
 # ☠️ PROJECT: MODERN KILL LAB (MKL)
-### Automated Cyber Range Deployment System // v2.3.0
-
-![Build Status](https://img.shields.io/badge/Build-PASSING-brightgreen?style=for-the-badge&logo=github)
-![Platform](https://img.shields.io/badge/Platform-CROSS--PLATFORM-blueviolet?style=for-the-badge&logo=linux)
-![Security Level](https://img.shields.io/badge/Security-OFFENSIVE-red?style=for-the-badge&logo=kali-linux)
-![Vectors](https://img.shields.io/badge/Attack_Vectors-18-critical?style=for-the-badge)
+### Automated Cyber Range Deployment System // v8.0 Gold Master
 
 ```
 ███╗   ███╗ ██████╗ ██████╗ ███████╗██████╗ ███╗   ██╗
@@ -24,136 +19,64 @@
 
 ---
 
-## MISSION BRIEFING
+## 🎯 TARGET ALPHA: Lab-DC01 (Windows Server 2022)
 
-**Modern Kill Lab (MKL)** is a weaponized "Infrastructure-as-Code" deployment tool featuring **18 distinct attack vectors** across Windows Active Directory, Linux containers, and cloud-native infrastructure.
+**Role:** Domain Controller, Database Server, Certificate Authority  
+**IP Address:** 10.0.0.10
 
-This lab supports **BOTH** Red Team and Blue Team training:
-- 🔴 **Red Team:** Execute modern attack chains and TTPs
-- 🔵 **Blue Team:** Detect, hunt, and respond using pre-installed Sysmon & auditd
+| Vulnerability | Configuration Detail | Exploitation Method | Tools |
+|---------------|----------------------|---------------------|-------|
+| **AS-REP Roasting** | User `svc_backup` has "Do not require Kerberos preauthentication" enabled. | Request a TGT for svc_backup. The DC returns an encrypted TGT without asking for a password. Crack the hash offline to get the password (`Backup2024!`). | Impacket `GetNPUsers.py`, Rubeus |
+| **Kerberoasting** | User `svc_sql` has a Service Principal Name (SPN) `MSSQLSvc/dc01.lab.local:1433`. | Request a TGS ticket for the SQL service. The ticket is encrypted with the service account's NTLM hash. Crack this offline to get the password (`Password123!`). | Impacket `GetUserSPNs.py`, Rubeus |
+| **Golden Ticket** | The `krbtgt` account password is statically set to `GodMode123!`. | Use the known password/hash of the krbtgt account to forge a TGT ticket for any user (e.g., Administrator) with infinite validity and arbitrary groups. | Impacket `ticketer.py`, Mimikatz |
+| **AD CS Misconfiguration (ESC8)** | AD CS Web Enrollment is installed on Port 80 without Extended Protection for Authentication (EPA). | Force the DC to authenticate to your attacker machine (e.g., via Coercer or SQLi). Relay that authentication to the AD CS web portal to request a certificate for the DC. | `ntlmrelayx.py`, PetitPotam, Coercer |
+| **SQL Injection** | Custom PHP HR Portal on Port 8080 uses unsanitized input: `SELECT ... WHERE ID = $id`. | Inject SQL commands into the `id` parameter. Use `UNION SELECT` to dump data or enable `xp_cmdshell` to execute OS commands. | SQLMap, Burp Suite, Browser |
+| **Weak Service Permissions** | The `svc_sql` account is a member of the `sysadmin` role in SQL Server. | Once you compromise the SQL service (via SQLi), you have full control over the database and underlying OS through `xp_cmdshell` (which you can enable as sysadmin). | SQLMap, Netcat (for reverse shell) |
+| **Fake Cloud Credentials** | `C:\Program Files\Azure AD Sync\connection.xml` contains a reversible encrypted password. | Read the XML file, extract the `PasswordEncrypted` string, and decrypt it (Base64 → `Valhalla123!`) to recover credentials. | PowerShell, aadconnect-extract |
+| **AMSI & EDR Bypass** | Weak configurations for AMSI and a custom "Fake EDR" process. | Patch `amsi.dll` in memory to bypass PowerShell security, or use VEH (Vectored Exception Handler) manipulation to bypass the fake EDR hooks. | PowerShell, C# exploits |
 
----
+### DC01 Services
 
-## 📊 ATTACK VECTOR MATRIX
-
-| # | Vector | Target | Category | MITRE | Difficulty |
-|---|--------|--------|----------|-------|------------|
-| 1 | SQL Injection | DC01 | Initial Access | T1190 | 🟢 Easy |
-| 2 | AI Prompt Injection / RCE | Web01 | Execution | T1059 | 🟢 Easy |
-| 3 | AS-REP Roasting | DC01 | Credential Access | T1558.004 | 🟢 Easy |
-| 4 | Kerberoasting | DC01 | Credential Access | T1558.003 | 🟢 Easy |
-| 5 | Hybrid Identity Attack | DC01 | Credential Access | T1552.001 | 🟡 Medium |
-| 6 | AD CS Relay (ESC8) | DC01 | Privilege Escalation | T1557.001 | 🟡 Medium |
-| 7 | AMSI Bypass | DC01 | Defense Evasion | T1562.001 | 🟡 Medium |
-| 8 | VEH/EDR Bypass | DC01 | Defense Evasion | T1562.001 | 🔴 Hard |
-| 9 | Reflective Code Injection | DC01 | Defense Evasion | T1620 | 🔴 Hard |
-| 10 | Process Hollowing | DC01 | Defense Evasion | T1055.012 | 🔴 Hard |
-| 11 | Credential Dumping | DC01 | Credential Access | T1003 | 🟡 Medium |
-| 12 | LOLBin Execution | DC01 | Execution | T1218 | 🟢 Easy |
-| 13 | ETW/Logging Bypass | DC01 | Defense Evasion | T1562.002 | 🟡 Medium |
-| 14 | Persistence Mechanisms | DC01 | Persistence | T1053.005 | 🟡 Medium |
-| 15 | Container Escape | Web01 | Privilege Escalation | T1611 | 🟡 Medium |
-| 16 | Kubernetes Attacks | Web01 | Privilege Escalation | T1610 | 🟡 Medium |
-| 17 | Linux Privilege Escalation | Web01 | Privilege Escalation | T1548 | 🟢 Easy |
-| 18 | Data Exfiltration | Web01 | Exfiltration | T1048 | 🟢 Easy |
+| Port | Service | URL |
+|------|---------|-----|
+| 80 | AD CS Web Enrollment | http://10.0.0.10/certsrv |
+| 8080 | Legacy HR Portal | http://10.0.0.10:8080/hr_portal |
+| 1433 | SQL Server Express | TCP |
+| 3389 | RDP | TCP |
+| 5985 | WinRM | TCP |
+| 88 | Kerberos | TCP/UDP |
+| 389/636 | LDAP/LDAPS | TCP |
 
 ---
 
-## 🏗️ ARSENAL
+## 🎯 TARGET BRAVO: Lab-Web01 (Debian 12)
 
-### 🎯 TARGET ALPHA: Lab-DC01 (Windows)
+**Role:** Web Server, Application Security Host, Pivot Point  
+**IP Address:** 10.0.0.20  
+**Domain Status:** Joined to `LAB.local`
 
-| Property | Value |
-|----------|-------|
-| **OS** | Windows Server 2022 |
-| **Role** | Domain Controller (LAB.local) |
-| **IP Address** | 10.0.0.10 |
-| **Attack Vectors** | 14 |
+| Vulnerability | Configuration Detail | Exploitation Method | Tools |
+|---------------|----------------------|---------------------|-------|
+| **SMB Remote Code Execution** | Samba share `[backup_drop]` has `guest ok = yes`, `force user = root`. A cron job runs bash on `*.sh` files in this share every minute. | Connect anonymously. Upload a shell script (e.g., reverse shell). Wait 60 seconds for the cron job to execute it as ROOT. | `smbclient`, `net view` |
+| **Insecure AI Agent** | Python Flask app on Port 5000 passes user input directly to `subprocess.check_output`. | Send a request like `/ask?query=ls -la` to achieve Command Injection. Use this to steal keys or pivot. | curl, Browser |
+| **Unsecured Kubernetes** | K3s cluster has a ServiceAccount `vuln-admin-sa` with `cluster-admin` privileges. | Extract the token for vuln-admin-sa (via the AI app or local access). Use it to authenticate to the API server and take full control of the cluster. | kubectl |
+| **Privileged Container** | Docker container `vuln_priv` runs with `--privileged` flag. | Mount the host's filesystem (`/dev/sda1`) inside the container and escape to the host OS. | Docker escape exploits |
+| **Docker Socket Mount** | Container `vuln_sock` has `/var/run/docker.sock` mounted. | Use the socket to communicate with the host Docker daemon. Spin up a new privileged container to execute commands on the host. | docker CLI (inside container) |
+| **Sudo Misconfiguration** | User `vagrant` has `NOPASSWD` sudo rights for `vim`. | Use `sudo vim -c ':!/bin/sh'` to spawn a root shell without a password. | Terminal |
+| **Hardcoded API Secrets** | `.env` file in `/home/vagrant/exfil_lab` contains fake AWS/Stripe keys. | Local file enumeration or "Post-Exploitation" looting to find credential leaks. | grep, find |
+| **API Logic Flaws** | vAPI and crAPI (Dockerized) contain BOLA/IDOR and Mass Assignment bugs. | Manipulate API IDs to access other users' data or reset their passwords. | Postman, Burp Suite |
 
-#### Services & Ports
+### Web01 Services
 
 | Port | Service | Description |
 |------|---------|-------------|
-| **80** | IIS | AD CS Web Enrollment (`/certsrv`) |
-| **8080** | XAMPP Apache | Legacy HR Portal (`/hr_portal`) |
-| **1433** | SQL Server Express | Database |
-| **3389** | RDP | Remote Desktop |
-| **5985** | WinRM | Windows Remote Management |
-| **88** | Kerberos | Authentication |
-| **389** | LDAP | Directory Services |
-| **636** | LDAPS | Secure LDAP |
-| **53** | DNS | Domain Name Services |
-
-#### Web Applications
-
-| Application | URL | Vulnerability |
-|-------------|-----|---------------|
-| **AD CS Web Enrollment** | `http://10.0.0.10/certsrv` | ESC8 - HTTP NTLM Relay |
-| **Legacy HR Portal** | `http://10.0.0.10:8080/hr_portal` | SQL Injection |
-
-#### Vulnerabilities Deployed
-
-| Vector | Component | Configuration |
-|--------|-----------|---------------|
-| SQLi | HR Portal | ODBC connection, unsanitized `$_GET["id"]` |
-| AS-REP | `svc_backup` | `DoesNotRequirePreAuth = True` |
-| Kerberoasting | `svc_sql` | SPN: `MSSQLSvc/dc01.lab.local:1433` |
-| Hybrid Identity | Azure AD Sync | Base64 password in `connection.xml` |
-| AD CS (ESC8) | IIS | HTTP Web Enrollment enabled (no HTTPS) |
-| AMSI | Registry | Weak ACLs on `HKLM:\SOFTWARE\Microsoft\AMSI\Providers` |
-| VEH | FakeEDR.exe | Compiled C# VEH monitor |
-| Reflective Injection | VulnerableLoader.cs | Unvalidated `Assembly.Load()` |
-| Credential Dumping | Multiple | SAM/SYSTEM/SECURITY backups, Credential Manager |
-| LOLBins | MSBuild | Pre-staged `payload.csproj` |
-| ETW/Logging | Registry | ScriptBlock Logging enabled |
-| Persistence | Scheduled Task | Hidden task: `WindowsDefenderUpdate` |
-
-#### Blue Team Tools (Pre-Installed)
-
-| Tool | Status | Configuration |
-|------|--------|---------------|
-| **Sysmon** | ✅ Active | SwiftOnSecurity config at `C:\Tools\Sysmon\config.xml` |
-| **ScriptBlock Logging** | ✅ Enabled | PowerShell Event ID 4104 |
-
----
-
-### 🎯 TARGET BRAVO: Lab-Web01 (Linux)
-
-| Property | Value |
-|----------|-------|
-| **OS** | Debian 12 (Bookworm) |
-| **Role** | Container & AppSec Host |
-| **IP Address** | 10.0.0.20 |
-| **Attack Vectors** | 4 |
-
-#### Services & Ports
-
-| Port | Service | Description |
-|------|---------|-------------|
-| **22** | SSH | OpenSSH |
-| **5000** | AI Agent | Vulnerable Flask App (runs as root) |
-| **3000** | Juice Shop | OWASP Training App |
-| **5002** | vAPI | API Security Lab |
-| **445** | Samba | SMB File Share (`/home/vagrant/share`) |
-| **6443** | K3s API | Kubernetes API Server |
-
-#### Vulnerabilities Deployed
-
-| Vector | Component | Configuration |
-|--------|-----------|---------------|
-| AI RCE | Flask App | `subprocess.check_output(query, shell=True)` as root |
-| Container Escape | Docker | `vuln_privileged` (privileged:true), `vuln_hostsock` (socket mount) |
-| Kubernetes | K3s | `vuln-admin-sa` ServiceAccount with cluster-admin |
-| Linux PrivEsc | sudo | `vagrant ALL=(ALL) NOPASSWD: /usr/bin/vim` |
-| Linux PrivEsc | Capabilities | `/usr/local/bin/python_cap` has `cap_setuid+ep` |
-| Exfiltration | Files | Fake secrets in `/home/vagrant/exfil_lab/.env` |
-| SMB | Samba | World-writable share at `/home/vagrant/share` |
-
-#### Blue Team Tools (Pre-Installed)
-
-| Tool | Status | Configuration |
-|------|--------|---------------|
-| **auditd** | ✅ Active | Monitoring `/etc/passwd` (key: identity) and `/bin/bash` (key: exec) |
+| 22 | SSH | OpenSSH |
+| 445 | SMB | Samba (`backup_drop` share) |
+| 5000 | AI Agent | Vulnerable Flask App (runs as root) |
+| 3000 | Juice Shop | OWASP Training App |
+| 5002 | vAPI | API Security Lab |
+| 8888 | crAPI | OWASP crAPI |
+| 6443 | K3s API | Kubernetes API Server |
 
 ---
 
@@ -164,7 +87,7 @@ This lab supports **BOTH** Red Team and Blue Team training:
 | Requirement | Specification |
 |-------------|---------------|
 | **Hardware** | 16GB RAM / 100GB Disk / VT-x CPU |
-| **Software** | Python 3.x, VirtualBox, Packer (auto-install offered) |
+| **Software** | Python 3.x (Packer & VirtualBox auto-installed) |
 | **Network** | Internet access for ISO/package downloads |
 
 ### Execution
@@ -175,14 +98,12 @@ cd ModernKillLab
 python3 master_build.py
 ```
 
-### Build Timeline
+### Build Process
 
-| Phase | Duration | Description |
-|-------|----------|-------------|
-| 1 | ~5 min | Dependency check, ISO download |
-| 2 | ~45-60 min | DC01 build (Windows + AD + Apps) |
-| 3 | ~15-20 min | Web01 build (Debian + Docker + K3s) |
-| 4 | ~1 min | Network configuration |
+1. **DC01 Build:** ~45-60 minutes (Windows + AD + SQL + AD CS)
+2. **DC01 Start:** Runs headless for Web01 domain join
+3. **Web01 Build:** ~15-20 minutes (Debian + Docker + K3s + Domain Join)
+4. **Final Config:** Internal network `psycholab`
 
 ---
 
@@ -192,156 +113,122 @@ python3 master_build.py
 
 | Account | Password | Notes |
 |---------|----------|-------|
-| `LAB\vagrant` | `Vagrant!123` | Local & Domain Admin |
+| `LAB\vagrant` | `Vagrant!123` | Domain Admin |
 | `LAB\Administrator` | `Vagrant!123` | Domain Admin |
-| `LAB\svc_sql` | `Password123!` | Kerberoastable (has SPN) |
+| `LAB\svc_sql` | `Password123!` | Kerberoastable, SQL sysadmin |
 | `LAB\svc_backup` | `Backup2024!` | AS-REP Roastable |
 | `LAB\helpdesk` | `Help123!` | Standard domain user |
-| `svc_adsync` | `Valhalla123!` | In Azure AD Sync XML (Base64) |
+| `krbtgt` | `GodMode123!` | Golden Ticket target |
 
-### Credential Manager (Stored on DC01)
+### Hidden/Extractable Credentials
 
-| Target Server | Username | Password |
-|---------------|----------|----------|
-| `fileserver.lab.local` | `LAB\backup_admin` | `BackupP@ss123!` |
-| `sqlserver.lab.local` | `sa` | `SQLAdm1n!` |
+| Location | Credential | Notes |
+|----------|------------|-------|
+| `C:\Program Files\Azure AD Sync\connection.xml` | `Valhalla123!` | Base64 encoded |
+| Windows Credential Manager | `LAB\backup_admin` : `BackupP@ss123!` | For fileserver.lab.local |
+| `/home/vagrant/exfil_lab/.env` | `API_KEY=sk_live_1234567890abcdef` | Fake secrets |
+| `/home/vagrant/exfil_lab/.env` | `AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE` | Fake secrets |
 
 ### Linux Accounts
 
 | Account | Password | Notes |
 |---------|----------|-------|
-| `vagrant` | `vagrant` | sudo access |
-
-### Other Credentials
-
-| Service | Credential | Location |
-|---------|------------|----------|
-| DSRM | `Vulnerable123!` | AD Safe Mode |
-| SQL Express | Windows Auth | Uses `LAB\svc_sql` |
+| `vagrant` | `vagrant` | Local user, sudo vim |
+| `LAB\vagrant` | `Vagrant!123` | Domain user (after join) |
 
 ---
 
-## 🌐 QUICK ACCESS REFERENCE
+## 🌐 NETWORK TOPOLOGY
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    psycholab (Internal Network)             │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│   ┌─────────────────┐              ┌─────────────────┐     │
+│   │   Lab-DC01      │              │   Lab-Web01     │     │
+│   │   10.0.0.10     │◄────────────►│   10.0.0.20     │     │
+│   │                 │   Domain     │                 │     │
+│   │ Windows 2022    │   Trust      │ Debian 12       │     │
+│   │ AD DS / AD CS   │              │ Domain Joined   │     │
+│   │ SQL Server      │              │ Docker / K3s    │     │
+│   └─────────────────┘              └─────────────────┘     │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🔧 QUICK ACCESS
 
 ### Web Services
 
 | Service | URL |
 |---------|-----|
-| **AD CS Web Enrollment** | http://10.0.0.10/certsrv |
-| **Legacy HR Portal** | http://10.0.0.10:8080/hr_portal |
-| **AI Agent** | http://10.0.0.20:5000 |
-| **Juice Shop** | http://10.0.0.20:3000 |
-| **vAPI** | http://10.0.0.20:5002 |
+| AD CS Web Enrollment | http://10.0.0.10/certsrv |
+| Legacy HR Portal | http://10.0.0.10:8080/hr_portal |
+| AI Agent | http://10.0.0.20:5000 |
+| Juice Shop | http://10.0.0.20:3000 |
+| vAPI | http://10.0.0.20:5002 |
+| crAPI | http://10.0.0.20:8888 |
 
-### Remote Access Commands
+### Remote Access
 
-**Windows (DC01):**
 ```bash
-# RDP
+# DC01 - RDP
 xfreerdp /v:10.0.0.10 /u:LAB\\vagrant /p:'Vagrant!123' /cert:ignore
 
-# WinRM (Evil-WinRM)
+# DC01 - WinRM
 evil-winrm -i 10.0.0.10 -u vagrant -p 'Vagrant!123'
 
-# WinRM (PowerShell)
-Enter-PSSession -ComputerName 10.0.0.10 -Credential LAB\vagrant
-```
-
-**Linux (Web01):**
-```bash
-# SSH
+# Web01 - SSH (Local)
 ssh vagrant@10.0.0.20
-# Password: vagrant
 
-# SMB
-smbclient //10.0.0.20/share -N
-```
+# Web01 - SSH (Domain)
+ssh LAB\\vagrant@10.0.0.20
 
----
-
-## 🛡️ BLUE TEAM QUICK START
-
-### Windows (DC01) - Sysmon Queries
-
-```powershell
-# View all Sysmon events
-Get-WinEvent -LogName 'Microsoft-Windows-Sysmon/Operational' -MaxEvents 100
-
-# Process Creation (Event ID 1)
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=1} -MaxEvents 50
-
-# Network Connections (Event ID 3)
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=3} -MaxEvents 50
-
-# Process Access (Event ID 10) - LSASS monitoring
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational';Id=10} |
-    Where-Object {$_.Properties[8].Value -like "*lsass*"}
-```
-
-### Linux (Web01) - auditd Queries
-
-```bash
-# View all audit events
-sudo ausearch -i
-
-# Identity file changes (key: identity)
-sudo ausearch -k identity -i
-
-# Command execution (key: exec)
-sudo ausearch -k exec -i
-
-# Real-time monitoring
-sudo tail -f /var/log/audit/audit.log
+# Web01 - SMB (Anonymous)
+smbclient //10.0.0.20/backup_drop -N
 ```
 
 ---
 
 ## 📁 DIRECTORY STRUCTURE
 
-### Windows (`C:\Tools\`)
+### Windows (C:\Tools\)
 ```
 C:\Tools\
-├── Sysmon\
-│   ├── Sysmon64.exe
-│   └── config.xml                  
 ├── AMSILab\
-│   └── vulnerable_loader.ps1       # AMSI test harness
+│   └── vuln.ps1
 ├── VEHLab\
-│   ├── FakeEDR.cs                  # Source
-│   └── FakeEDR.exe                 # Compiled
-├── ReflectiveLab\
-│   └── VulnerableLoader.cs         # Assembly.Load vuln
-├── HollowingLab\
-│   └── README.txt                  # Target processes
+│   ├── FakeEDR.cs
+│   └── FakeEDR.exe
 ├── CredLab\
-│   ├── SAM.bak                     # Registry backup
-│   ├── SYSTEM.bak                  # Registry backup
-│   └── SECURITY.bak                # Registry backup
+│   ├── SAM.bak
+│   ├── SYSTEM.bak
+│   └── SECURITY.bak
 ├── LOLBinLab\
-│   └── payload.csproj              # MSBuild payload
-├── DriverLab\
-│   └── README.md                   # BYOVD instructions
+│   └── payload.csproj
 └── PersistenceLab\
 ```
 
-### Linux (`/home/vagrant/`)
+### Linux (/home/vagrant/)
 ```
 /home/vagrant/
 ├── ai_agent/
-│   └── app.py                      # Vulnerable Flask app
+│   └── app.py
 ├── container_lab/
-│   └── docker-compose-vuln.yml     # Escape scenarios
+│   └── docker-compose-vuln.yml
 ├── k8s_lab/
-│   └── vuln-sa.yaml                # Overprivileged SA
+│   └── vuln.yaml
 ├── exfil_lab/
-│   └── .env                        # Fake API keys
+│   └── .env
+├── share/                    # SMB backup_drop share
 ├── crapi/
-│   └── docker-compose.yml          # OWASP crAPI
-├── share/                          # Samba share (777)
+│   └── docker-compose.yml
 └── .kube/
-    └── config                      # K3s kubeconfig
+    └── config
 ```
-
 
 ---
 
