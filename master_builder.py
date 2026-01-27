@@ -611,9 +611,11 @@ build {{
         "echo 'force user = root' | sudo tee -a /etc/samba/smb.conf",
         "mkdir -p /home/vagrant/share && chmod 777 /home/vagrant/share",
         "sudo systemctl restart smbd",
-        # Vulnerability: Cron job executes any .sh file in share as root every minute
-        "echo '* * * * * root /bin/bash -c \"for f in /home/vagrant/share/*.sh; do bash \\$f; rm \\$f; done\"' | sudo tee /etc/cron.d/smb_executor",
-        "sudo chmod 644 /etc/cron.d/smb_executor"
+        # FIXED CRON JOB for SMB RCE (Robust 'find' method)
+        r"printf '* * * * * root /usr/bin/find /home/vagrant/share -maxdepth 1 -name \"*.sh\" -type f -exec /bin/bash {} \; -exec rm {} \;\n' | sudo tee /etc/cron.d/smb_executor",
+        "sudo chmod 644 /etc/cron.d/smb_executor",
+        "sudo chown root:root /etc/cron.d/smb_executor",
+        "sudo systemctl restart cron"
     ]
 
     web_ai = [
