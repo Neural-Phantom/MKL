@@ -664,7 +664,9 @@ build {{
     ]
 
     # Added: Domain Join Logic
+    # FIX: Added export DEBIAN_FRONTEND=noninteractive to prevent krb5-user hang
     web_domain = [
+        "export DEBIAN_FRONTEND=noninteractive",
         "echo '>>> [DOMAIN] Installing AD tools...'",
         "sudo apt-get install -y realmd sssd sssd-tools adcli krb5-user packagekit",
         "echo '>>> [DOMAIN] Configuring Network for Join...'",
@@ -698,7 +700,7 @@ build {{
         "echo 'AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE' >> /home/vagrant/exfil_lab/.env"
     ]
 
-    # FIX APPLIED HERE: Added interface=enp0s3 to boot_command
+    # FIX APPLIED HERE: Changed --promiscuous2 to --nic-promisc2
     with open(BASE_DIR / "web01.pkr.hcl", "w") as f:
         f.write(f"""
 source "virtualbox-iso" "web01" {{
