@@ -458,6 +458,8 @@ class FakeEDR {
         "New-ItemProperty -Path $tcpKey.PSPath -Name 'TcpPort' -Value '1433' -PropertyType String -Force",
         "Stop-Service 'MSSQL$SQLEXPRESS' -Force; Start-Service 'MSSQL$SQLEXPRESS'",
         "Write-Host '>>> [3/10] Creating Vulnerable Users...' -ForegroundColor Cyan",
+        # FIXED: Added 'vagrant' domain user to satisfy verification checks
+        "New-ADUser -Name vagrant -SamAccountName vagrant -AccountPassword (ConvertTo-SecureString 'Vagrant!123' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "New-ADUser -Name svc_sql -SamAccountName svc_sql -AccountPassword (ConvertTo-SecureString 'Password123!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "New-ADUser -Name svc_backup -SamAccountName svc_backup -AccountPassword (ConvertTo-SecureString 'Backup2024!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "New-ADUser -Name helpdesk -SamAccountName helpdesk -AccountPassword (ConvertTo-SecureString 'Help123!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
@@ -599,10 +601,15 @@ build {{
         "sudo sh get-docker.sh",
         "sudo usermod -aG docker vagrant",
         "sudo systemctl enable docker; sudo systemctl start docker",
-        "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='--disable=traefik' sh -",
+        
+        # FIXED: K3s Wait Loop & Permissions
+        "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='--disable=traefik' K3S_KUBECONFIG_MODE='644' sh -",
+        "echo '>>> Waiting for K3s to stabilize...'",
+        "sleep 30",
         "mkdir -p /home/vagrant/.kube",
         "sudo cp /etc/rancher/k3s/k3s.yaml /home/vagrant/.kube/config",
         "sudo chown vagrant:vagrant /home/vagrant/.kube/config",
+        
         "echo '[backup_drop]' | sudo tee -a /etc/samba/smb.conf",
         "echo 'path = /home/vagrant/share' | sudo tee -a /etc/samba/smb.conf",
         "echo 'read only = no' | sudo tee -a /etc/samba/smb.conf",
@@ -611,8 +618,10 @@ build {{
         "echo 'force user = root' | sudo tee -a /etc/samba/smb.conf",
         "mkdir -p /home/vagrant/share && chmod 777 /home/vagrant/share",
         "sudo systemctl restart smbd",
-        # FIXED CRON JOB for SMB RCE (Robust 'find' method)
-        r"printf '* * * * * root /usr/bin/find /home/vagrant/share -maxdepth 1 -name \"*.sh\" -type f -exec /bin/bash {} \; -exec rm {} \;\n' | sudo tee /etc/cron.d/smb_executor",
+        
+        # FIXED CRON JOB for SMB RCE (Forced overwrite with 'find')
+        # We use a here-doc to overwrite file content completely
+        r"sudo bash -c 'cat > /etc/cron.d/smb_executor <<EOF\n* * * * * root /usr/bin/find /home/vagrant/share -maxdepth 1 -name \"*.sh\" -type f -exec /bin/bash {} \; -exec rm {} \;\nEOF'",
         "sudo chmod 644 /etc/cron.d/smb_executor",
         "sudo chown root:root /etc/cron.d/smb_executor",
         "sudo systemctl restart cron"
@@ -669,8 +678,9 @@ build {{
 
     web_adv = [
         "mkdir -p /home/vagrant/container_lab",
-        r'printf "version: \"3\"\nservices:\n  vuln_priv:\n    image: ubuntu:latest\n    privileged: true\n    command: sleep infinity\n  vuln_sock:\n    image: ubuntu:latest\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n    command: sleep infinity\n" > /home/vagrant/container_lab/docker-compose-vuln.yml',
-        "cd /home/vagrant/container_lab && sudo docker compose -f docker-compose-vuln.yml up -d || exit 1",
+        # FIXED: Renamed to standard docker-compose.yml for auto-discovery
+        r'printf "version: \"3\"\nservices:\n  vuln_priv:\n    image: ubuntu:latest\n    privileged: true\n    command: sleep infinity\n  vuln_sock:\n    image: ubuntu:latest\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n    command: sleep infinity\n" > /home/vagrant/container_lab/docker-compose.yml',
+        "cd /home/vagrant/container_lab && sudo docker compose up -d || exit 1",
         "echo 'Waiting for K3s...'",
         "until sudo kubectl get nodes 2>/dev/null | grep -q ' Ready'; do sleep 5; done",
         "mkdir -p /home/vagrant/k8s_lab",
