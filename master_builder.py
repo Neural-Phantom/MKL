@@ -560,6 +560,7 @@ source "virtualbox-iso" "dc01" {{
   floppy_files         = ["./answer_files/Autounattend.xml"]
   shutdown_command     = "shutdown /s /t 10 /f"
   shutdown_timeout     = "60m"
+  post_shutdown_delay  = "2m"
   vm_name              = "Lab-DC01"
   guest_os_type        = "Windows2019_64"
   iso_url              = "{iso_path_win}"
@@ -619,9 +620,9 @@ build {{
         "mkdir -p /home/vagrant/share && chmod 777 /home/vagrant/share",
         "sudo systemctl restart smbd",
         
-        # FIXED CRON JOB for SMB RCE (Forced overwrite with 'find')
-        # We use a here-doc to overwrite file content completely
-        r"sudo bash -c 'cat > /etc/cron.d/smb_executor <<EOF\n* * * * * root /usr/bin/find /home/vagrant/share -maxdepth 1 -name \"*.sh\" -type f -exec /bin/bash {} \; -exec rm {} \;\nEOF'",
+        # FIXED CRON JOB: Reverted to printf which handles newline escaping correctly in Packer
+        r"printf '* * * * * root /usr/bin/find /home/vagrant/share -maxdepth 1 -name \"*.sh\" -type f -exec /bin/bash {} \; -exec rm {} \;\n' | sudo tee /etc/cron.d/smb_executor",
+        
         "sudo chmod 644 /etc/cron.d/smb_executor",
         "sudo chown root:root /etc/cron.d/smb_executor",
         "sudo systemctl restart cron"
