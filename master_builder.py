@@ -392,7 +392,7 @@ class FakeEDR {
     msbuild_b64 = encode_file_content(msbuild_src)
 
     # =========================================================================
-    # DC01 SCRIPT ARRAYS (FIXED SSL ERROR)
+    # DC01 SCRIPT ARRAYS (FIXED SSL ERROR & ACCOUNT EXISTS ERROR)
     # =========================================================================
     
     dc_base = [
@@ -458,8 +458,8 @@ class FakeEDR {
         "New-ItemProperty -Path $tcpKey.PSPath -Name 'TcpPort' -Value '1433' -PropertyType String -Force",
         "Stop-Service 'MSSQL$SQLEXPRESS' -Force; Start-Service 'MSSQL$SQLEXPRESS'",
         "Write-Host '>>> [3/10] Creating Vulnerable Users...' -ForegroundColor Cyan",
-        # FIXED: Added 'vagrant' domain user to satisfy verification checks
-        "New-ADUser -Name vagrant -SamAccountName vagrant -AccountPassword (ConvertTo-SecureString 'Vagrant!123' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
+        # FIXED: Wrapped 'vagrant' user creation in try/catch to suppress 'Account already exists' error
+        "try { New-ADUser -Name vagrant -SamAccountName vagrant -AccountPassword (ConvertTo-SecureString 'Vagrant!123' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true } catch { Write-Host 'Vagrant user exists, skipping creation.' }",
         "New-ADUser -Name svc_sql -SamAccountName svc_sql -AccountPassword (ConvertTo-SecureString 'Password123!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "New-ADUser -Name svc_backup -SamAccountName svc_backup -AccountPassword (ConvertTo-SecureString 'Backup2024!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
         "New-ADUser -Name helpdesk -SamAccountName helpdesk -AccountPassword (ConvertTo-SecureString 'Help123!' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true",
